@@ -331,7 +331,28 @@ int cprintf(const char *fmt, ...);
 
 主要应用场景为内核初始化（init.c）过程中输出版本、加载信息等。
 
-该模块就是 `libs/sbi.c → console.c → stdio.c` 这条封装链：下层 `libs/sbi.c` 通过 `ecall` 与硬件/固件交互，上层 `kern/libs/stdio.c` 对外提供 `cprintf` 格式化输出。（交互关系）
+该模块就是 `libs/sbi.c → console.c → stdio.c` 这条封装链：下层 `libs/sbi.c` 通过 `ecall` 与硬件/固件交互，上层 `kern/libs/stdio.c` 对外提供 `cprintf` 格式化输出。
+
+在进行具体的链路调试前，先验证 OpenSBI 固件在 QEMU 模拟器上的启动状态。
+
+![Image](./images/qemu_boot_sbi.png)
+
+分析：
+如上图所示，QEMU 成功加载了 OpenSBI 固件，其运行基址为 0x80000000。此启动界面确认了：
+固件就绪：底层 M 模式固件已初始化完成，准备好接收 S 模式（内核）发来的 ecall 请求。
+硬件抽象：OpenSBI 报告了 QEMU Virt Machine 的平台特性，这为后续 libs/sbi.c 中调用的 SBI 标准接口提供了底层的软件抽象支持。
+这一步确保了后续在 sbi_console_putchar 中调用的 ecall 指令能够被运行中的 OpenSBI 固件正确捕获并处理。
+
+为验证 cprintf -> cons_putc -> sbi_console_putchar 这条封装链的正确性，用 GDB 对内核初始化阶段的打印流程进行了实时追踪。
+
+
+通过在 sbi_console_putchar 设置断点，当内核打印启动信息时，触发断点并获取调用栈（如下图）
+
+![Image](./images/sbi_bt_trace.png)
+
+分析：通过 bt 指令显示的调用栈（Backtrace）证实了数据流的完整路径，从最高层的格式化输出接口 cprintf (#5)，经过 vcprintf (#4) 和 vprintfmt (#3) 进行复杂的变参解析，再由 cputch (#2) 调用 cons_putc (#1)，最终下沉到底层的 sbi_console_putchar (#0) 进行硬件交互。此调用链与代码中定义的封装结构一致，证明了分层架构在运行时的连通性。
+
+特权级陷入机制：在 sbi_console_putchar 函数中，内核将字符参数传入，并调用 sbi_call 发起 ecall 指令。这标志着内核（S 模式）通过 陷入（Trap）机制，将控制权从 S 模式暂时让渡给处于 M 模式的 OpenSBI。由于内核受到特权级限制，无法直接访问 UART 串口的底层物理寄存器，必须通过这种方式请求固件代为执行 I/O 操作。这是 RISC-V 架构下实现硬件资源安全隔离与受控访问的核心机制。”
 
 ---
 
