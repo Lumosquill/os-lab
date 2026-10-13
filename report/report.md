@@ -130,47 +130,6 @@ SECTIONS
 
 ---
 
-##### 第一次迭代：让 AI 逐条解释链接脚本
-
-**遇到的问题：**
-
-- 问题1：AI 泛泛地说“链接脚本描述内存布局”，没有指出 `PROVIDE`、`ALIGN`、`/DISCARD/` 各自的作用，也没提到 `edata`/`end` 会被 `init.c` 使用。
-
-**问题解决策略：**
-
-- 针对问题1：追问时补充 `kern/init/entry.S` 与 `kern/init/init.c` 作为上下文；`[GUARANTEE]` 按模板改为“需要交付说明的语句与符号清单”（`OUTPUT_ARCH` → `/DISCARD/`），使回答逐条可核对。
-
----
-
-##### 第二次迭代：用工具输出反向验证 AI 的结论
-
-**遇到的问题：**
-
-- 问题1：AI 声称“`etext`、`edata`、`end` 三个符号都会被定义并出现在符号表中”；实测 `grep -E ' (etext|edata|end)$' obj/kernel.sym` 只得到 `edata` 与 `end`，**`etext` 根本不存在**。
-- 问题2：AI 沿用指导书写法，认为符号文件是 `bin/kernel.sym`；实测该路径不存在（`grep: bin/kernel.sym: No such file or directory`），真实位置是 `obj/kernel.sym`。
-
-**问题解决策略：**
-
-- 针对问题1：追问“`PROVIDE(sym = .)` 在什么条件下才会真正定义符号？”→ 确认 GNU `ld` 的语义是“**仅当该符号被引用、且别处未定义时才定义**”。本工程 `init.c` 的 `extern char edata[], end[]` 引用了后两者，而全工程无人引用 `etext`，因此它未被定义。结论以实测为准。
-- 针对问题2：阅读 `Makefile` 中 `symfile = $(call cgtype,$(call toobj,$(1)),o,sym)` 的展开过程，确认符号表与反汇编产物的真实路径是 `obj/kernel.sym`、`obj/kernel.asm`，并把这一“读码发现”记入报告。
-
-**最终结果：**
-
-经过 2 次迭代，该模块最终：
-
-- 编译通过（`make clean && make`，8 个源文件全部编译、链接成功）
-- 入口点与设计一致（`Entry point address: 0x80200000`）
-- 段布局与设计一致（`.text` 起于 0x80200000；`.data` 恰为 8KB 内核栈；`.sdata` 紧随其后）
-- 符号地址与推导一致（`bootstack = 0x80201000`、`bootstacktop = 0x80203000`、差值 `0x2000`）
-
-**关键改进点总结：**
-
-1. 把“入口点必须落在 `BASE_ADDRESS`”这类**正确性约束**作为边界情况写进 `[SPECIFICATION]` 的 Case 3（不把 `.text.kern_entry` 排首条会怎样），而不是任由 AI 泛泛解释。
-2. `[GUARANTEE]` 按模板改为“需要交付说明的语句与符号清单”（`OUTPUT_ARCH` / `ENTRY` / `BASE_ADDRESS` / `SECTIONS` / `PROVIDE` / `/DISCARD/`），使每条回答都能落到具体语句上。
-3. 明确“**以工具输出为准**”的验证原则：`PROVIDE` 的语义、符号文件的真实路径都由 `readelf`/`objdump`/`obj/kernel.sym` 定案，而不是采信 AI 的复述。
-
----
-
 ### 功能模块：内核入口 entry.S / init.c
 
 **负责人：** 2410699-张欣妍
@@ -260,50 +219,6 @@ int kern_init(void) {
 3. `kern_init` 开头将 `a0`、`a2` 分别置为 `edata`、`end`（均为 `0x80203008`），`sub a2, a2, a0` 使 `a2 = 0`，机器级地证明 `edata == end`、`memset` 长度为 0。
 4. `kern_init` 不是叶子函数，仍分配 16 字节栈帧并保存 `ra`；`while (1)` 编译为跳转到自身的 2 字节 `j`。
 5. 传给 `cprintf` 的字符串指针位于 `.rodata`（`0x802004a8` 即段表中 `.rodata` 的起始地址），与上一模块的段布局证据互相印证。
-
----
-
-##### 第一次迭代：解释入口两条指令
-
-**遇到的问题：**
-
-- 问题1：AI 把 `bootstacktop` 描述为“栈的**底部**”（它其实是高地址末端、即栈顶），方向说反。
-- 问题2：AI 只回答了“设置了栈指针”，**没有回答“目的”**（满足 C 调用约定、为 `kern_init` 准备运行环境），而练习1 正是要求“操作 + 目的”两问。
-- 问题3：`tail` 被说成“普通函数调用”，没有指出它不保存返回地址。
-
-**问题解决策略：**
-
-- 针对问题1、3：把“不得把 `bootstacktop` 说成栈底”“说明 `tail` 与 `call` 的区别”写进 `[SPECIFICATION]` 的边界情况与 `[Requirements]`，而不是事后反复纠正。
-- 针对问题2：在 `[PROMPT]` 的任务描述中把问题拆成“完成了什么操作”“目的是什么”两问，并在 `[GUARANTEE]` 中把这两个符号列为交付项，要求逐项作答。
-
----
-
-##### 第二次迭代：数值推导与实测核对
-
-**遇到的问题：**
-
-- 问题1：AI 给出的 `KSTACKSIZE` 只有符号表达式，没有算出字节数；报告需要“8KB / 0x2000 / 2 页”这类可核对的具体数字。
-- 问题2：AI 依据指导书认为符号文件是 `bin/kernel.sym`，且认为 `tail` 一定被汇编为 4 字节的 `jal x0`；实测反汇编显示它是 **2 字节的 `c.j`**，`kern_entry` 处合计仅 10 字节。
-
-**问题解决策略：**
-
-- 针对问题1：在 `[RELY]` 中给出 `PGSIZE`、`PGSHIFT`、`KSTACKPAGE` 的真实宏定义，要求“必须给出具体数值”，据此得到 `KSTACKSIZE = 2 × 4096 = 8192 = 0x2000`。
-- 针对问题2：以 `objdump -d`、`obj/kernel.sym` 的实测输出为准修正结论，并进一步发现：由于 `bootstacktop` 页对齐，`la` 展开后的第二条 `addi sp, sp, 0` 是空操作，**`auipc` 执行完 `sp` 即为最终值**；这正好解释了练习2 中 `watch $sp` 在 `PC = 0x80200004` 处就命中并显示 `0x80203000` 的现象。
-
-**最终结果：**
-
-经过 2 次迭代，该模块最终：
-
-- 编译通过，反汇编与源码逐行对应
-- `sp` 的最终值与设计一致（`0x80203000`，即 `bootstack + 0x2000`）
-- 与成员C 的 GDB 实测相互印证（`0x8001ef20 → 0x80203000`）
-- 功能符合预期（`kern_init` 成功打印 `(THU.CST) os is loading ...`）
-
-**关键改进点总结：**
-
-1. 把“完成了什么操作、目的是什么”两问写进 `[PROMPT]` 的任务描述；把“不得把 `bootstacktop` 说成栈底”“说明 `tail` 与 `call` 的区别”分别写进 `[SPECIFICATION]` 的边界情况与 `[Requirements]`，从源头避免方向性错误。
-2. 在 `[RELY]` 中补齐真实宏定义，使 `KSTACKSIZE = 8192` 等数值可推导、可核对。
-3. 坚持“**以 `objdump -d` / `obj/kernel.sym` 的实测输出为准**”，纠正了指导书关于 `bin/kernel.sym` 与 `tail → jal x0` 的表述偏差，并把压缩指令扩展（`c.j`）这一发现记入报告。
 
 ---
 
