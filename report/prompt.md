@@ -122,3 +122,145 @@ static void page_init(void);   // kern/mm/pmm.c；由 pmm_init() 调用，必须
 - 必须满足 init_memmap 的契约（n > 0，页此前处于保留状态）；
 - 除建立上述全局状态和向管理器移交空闲页之外，不产生其他副作用。
 ````
+
+2410699-张欣妍：
+
+````
+[PROMPT]
+**任务**：修改两个文件，完成 Best-Fit（最佳适配）连续物理内存分配算法并接入内核。
+1. 在 kern/mm/best_fit_pmm.c 中标有 "//lab2 function2-2" 的位置实现完整的 Best-Fit 分配器，
+   包括内部状态、各管理函数，以及 const struct pmm_manager best_fit_pmm_manager 的注册结构
+   （该结构已在 kern/mm/best_fit_pmm.h 中 extern 声明）。
+   分配策略：从所有 property >= n 的空闲块中选择 property 最小的那个（最合适的块），
+   而不是像 First-Fit 那样取链表中第一个够大的块。
+2. 在 kern/mm/pmm.c 的 init_pmm_manager() 中把 pmm_manager 由 &default_pmm_manager
+   改为 &best_fit_pmm_manager，使内核运行和 check_alloc_page() 检查的都是 Best-Fit。
+本任务只做“一种新的分配策略”，不改变 pmm_manager 这套机制，也不实现 Buddy System / SLUB。
+
+**操作要求**：你必须在项目中修改实际文件，而不是仅展示代码。
+- 可以修改：kern/mm/best_fit_pmm.c 的标记位置（标记之后、两个测试函数之前），
+  以及文件末尾用于注册 best_fit_pmm_manager 的代码；kern/mm/pmm.c 中 init_pmm_manager()
+  里那一条给 pmm_manager 赋值的语句及紧邻的一行注释。
+- 不得修改：kern/mm/best_fit_pmm.c 中的 basic_check() 与 best_fit_check()（框架测试，逐字保留，
+  连注释和 #ifdef ucore_test 也要保留）；kern/mm/default_pmm.c；pmm.h、best_fit_pmm.h、
+  memlayout.h、list.h 等头文件；page_init()、entry.S、Makefile、链接脚本，以及 tools/ 下的评分文件。
+- 保留文件中已有的代码与注释；把标记里的 "YOUR CODE" 换成我的学号 2410699。
+
+**输出要求**：直接在标记位置写入完整实现。实现完成后必须满足：
+1. 在 -Wall -Werror 下无告警通过编译（Makefile 用 -Wno-unused 关掉了"未使用变量/函数"这一类告警，其余告警都会被当成错误）；
+2. 内核能正常启动，check_alloc_page() 中 best_fit_check() 的全部 assert 都能通过，
+   最后打印 check_alloc_page() succeeded!；
+3. make grade 输出 [Test 2] Best-Fit: PASS；
+4. 终端打印 memory management: best_fit_pmm_manager。
+
+[RELY]
+// kern/mm/pmm.h —— 机制：内核只通过这组函数指针调用具体策略
+struct pmm_manager {
+    const char *name;
+    void (*init)(void);
+    void (*init_memmap)(struct Page *base, size_t n);
+    struct Page *(*alloc_pages)(size_t n);      // 分配连续的 n 个页
+    void (*free_pages)(struct Page *base, size_t n);
+    size_t (*nr_free_pages)(void);
+    void (*check)(void);
+};
+extern const struct pmm_manager *pmm_manager;
+struct Page *alloc_pages(size_t n);  void free_pages(struct Page *base, size_t n);
+size_t nr_free_pages(void);          // 以上三个是上层入口，内部转发给 pmm_manager
+#define alloc_page()  alloc_pages(1)
+#define free_page(page) free_pages(page, 1)
+
+// kern/mm/memlayout.h —— 页描述符与空闲区
+struct Page {
+    int ref;                        // 引用计数
+    uint64_t flags;                 // 位 0: PG_reserved；位 1: PG_property
+    unsigned int property;          // 本节含义：只有空闲块的头页才非 0，值为该块的页数
+    list_entry_t page_link;         // 挂到空闲链表上的链节点
+};
+SetPageProperty(p) / ClearPageProperty(p) / PageProperty(p)
+SetPageReserved(p) / ClearPageReserved(p) / PageReserved(p)
+#define le2page(le, member) to_struct((le), struct Page, member)   // 链节点 -> Page 首地址
+typedef struct { list_entry_t free_list; unsigned int nr_free; } free_area_t;
+set_page_ref(page, val) / page_ref(page)   // 引用计数：ref 为 0 表示该页当前没有使用者
+
+// libs/list.h —— 双向链表，表头自身也当作一个节点
+list_init(le) / list_empty(le) / list_next(le) / list_prev(le)
+list_add(le, elm)            // 把 elm 插到 le 之后
+list_add_before(le, elm)     // 把 elm 插到 le 之前
+list_del(le)                 // 把 le 从链表中摘下（不重新初始化）
+
+// 现成参考实现：kern/mm/default_pmm.c（First-Fit），可对照它的 init / init_memmap /
+// free_pages / 空块合并写法；唯一需要改的是 alloc_pages 的选块策略。
+
+// 框架测试的两个硬性约定（写在 best_fit_pmm.c 里，必须逐字保留、不能改）
+// basic_check() 与 best_fit_check() 直接引用了 free_list 和 nr_free 这两个标识符，并且：
+//   - 会遍历 free_list，要求每个块头页满足 PageProperty(p)，且各块 property 之和 == nr_free_pages()；
+//   - 会通过 free_pages() 造出 [占用][空闲 2 页][占用][空闲 1 页] 这样的布局，
+//     再断言 alloc_pages(4) == NULL、alloc_pages(1) 返回的是那个“1 页的空闲块”（地址 p0+4），
+//     alloc_pages(2) 取到那个“2 页的空闲块”；
+//   - 会把 free_list 与 nr_free 备份后清空、再恢复，并检查恢复后的链表与原来完全一致。
+// 因此：空闲链表的头页必须满足“property = 块大小 且 PageProperty 置位”；
+//       合并只能发生在物理地址相邻的空闲块之间；链表必须按物理地址升序，prev/next 才是相邻块。
+
+// kern/mm/pmm.c
+static void init_pmm_manager(void) {
+    pmm_manager = &default_pmm_manager;      // ← 只改这一行（及紧邻注释）
+    cprintf("memory management: %s\n", pmm_manager->name);
+    pmm_manager->init();
+}
+
+[GUARANTEE]
+必须提供的符号（best_fit_pmm.c 内部函数都用 static）：
+```c
+static void best_fit_init(void);
+static void best_fit_init_memmap(struct Page *base, size_t n);
+static struct Page *best_fit_alloc_pages(size_t n);
+static void best_fit_free_pages(struct Page *base, size_t n);
+static size_t best_fit_nr_free_pages(void);
+const struct pmm_manager best_fit_pmm_manager;   // pmm.h 之外另需 extern 声明（best_fit_pmm.h 已有）
+```
+你可以根据需要添加内部静态变量与辅助函数，但不得改动两个测试函数与对外接口。
+
+[SPECIFICATION]
+## best_fit_init_memmap(base, n)
+**Pre-Condition**: n > 0；[base, base+n) 这些页此前处于“保留”状态（best_fit_init_memmap 会断言 PageReserved）。
+**Post-Condition**:
+- 这 n 个页的 flags 与 property 被清零、ref 置 0；
+- base 成为该空闲块的头页：base->property = n 且 PageProperty(base) 为真，其他页的 property 为 0；
+- 这一整块以“一个节点”的形式挂在空闲链表上，链表仍按物理地址升序；
+- nr_free 增加 n。
+
+## best_fit_alloc_pages(n)
+**Pre-Condition**: n > 0；空闲链表与 nr_free 处于一致状态（各块 property 之和 == nr_free）。
+**Post-Condition**:
+- n > nr_free 或无块满足 property >= n 时：返回 NULL，链表与 nr_free 不变；
+- 否则返回一个空闲块的头页地址，块大小 >= n；被返回的块从链表中摘下，头页的 PageProperty 被清除、
+  property 为 0（表示已被占用），nr_free 减少 n；
+- 若被选中的块比 n 大，剩余部分 (page+n, property-n) 作为新的空闲块头页放回链表原来的位置，
+  保持物理地址升序。
+
+## best_fit_free_pages(base, n)
+**Pre-Condition**: n > 0；[base, base+n) 是一段已分配出去的连续页（未保留、且头页 PageProperty 为假）。
+**Post-Condition**:
+- 这 n 个页的 flags 清零、ref 置 0，base 成为空闲块头页（property = n，PageProperty 置位）；
+- 该块插入空闲链表并保持物理地址升序；若前一个空闲块（prev）恰好与本块物理相邻则合并，
+  若后一个空闲块（next）也相邻则继续合并，合并后只保留一个头页的 property/PageProperty；
+- nr_free 增加 n。
+
+## 选块策略
+- 只能是“所有 property >= n 的块里 property 最小的一个”，不能遇到第一个够大的块就 break；
+- 空闲块大小相同时，取链表中靠前的那个，保证行为确定、可复现。
+
+**Case 1（恰好适配）**: 存在 property == n 的块：直接整块摘下，不产生剩余分片。
+**Case 2（过大）**: 最小的够用块 property > n：切出前 n 页返回，剩余部分作为新块留在链表原位置。
+**Case 3（相邻合并）**: 释放时相邻空闲块必须合并成更大块，避免同一段内存被切成多个碎片。
+**Case 4（空链表）**: 链表为空时 alloc 返回 NULL；free 后链表只含一个节点，表头前后指针自洽。
+
+**Requirements**:
+- 两个测试函数 basic_check() / best_fit_check() 不能修改，因此实现必须满足它们对 free_list、nr_free、
+  property 与 PageProperty 的上述约定；
+- 必须定义 free_list 与 nr_free 这两个标识符（沿用 First-Fit 的做法：一个 static free_area_t
+  加两个同名宏），否则测试函数编译不过；
+- 不允许改 pmm_manager 结构体，只能提供一个新的 const struct pmm_manager 实例；
+- 不允许为了通过测试而修改、关闭或绕过 assert。
+````
