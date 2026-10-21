@@ -1,5 +1,7 @@
 #include <default_pmm.h>
 #include <best_fit_pmm.h>
+#include <buddy_pmm.h>
+#include <slub.h>
 #include <defs.h>
 #include <error.h>
 #include <memlayout.h>
@@ -34,8 +36,8 @@ static void check_alloc_page(void);
 
 // init_pmm_manager - initialize a pmm_manager instance
 static void init_pmm_manager(void) {
-    //lab2 function2-2 学号：2410699：切换为 Best-Fit 连续物理内存分配算法
-    pmm_manager = &best_fit_pmm_manager;
+    //lab2 任务三 学号：2411433：切换为 Buddy System 连续物理内存分配算法
+    pmm_manager = &buddy_pmm_manager;
     cprintf("memory management: %s\n", pmm_manager->name);
     pmm_manager->init();
 }
@@ -143,6 +145,10 @@ void pmm_init(void) {
 
     // use pmm->check to verify the correctness of the alloc/free function in a pmm
     check_alloc_page();
+
+    // 扩展任务 Challenge 学号：2411433：在页级分配器之上初始化并自检 SLUB 任意大小分配器
+    slub_init();
+    slub_check();
 
     extern char boot_page_table_sv39[];
     satp_virtual = (pte_t*)boot_page_table_sv39;

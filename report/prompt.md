@@ -264,3 +264,349 @@ const struct pmm_manager best_fit_pmm_manager;   // pmm.h 之外另需 extern �
 - 不允许改 pmm_manager 结构体，只能提供一个新的 const struct pmm_manager 实例；
 - 不允许为了通过测试而修改、关闭或绕过 assert。
 ````
+
+任务三：Buddy System（2411433-李烁菲）
+
+## 提示词 A：生成 Buddy System 分配模块并接入内核
+
+````markdown
+[PROMPT]
+**任务**：在 ucore 物理内存管理框架（kern/mm/）中新增 Buddy System（伙伴系统）连续物理页分配模块，并接入内核。涉及三个文件：
+- 新建 `kern/mm/buddy_pmm.c`：实现 Buddy 分配器及其 `pmm_manager` 注册结构 `buddy_pmm_manager`；
+- 新建 `kern/mm/buddy_pmm.h`：声明 `extern const struct pmm_manager buddy_pmm_manager;`，写法与现有 `best_fit_pmm.h`、`default_pmm.h` 一致；
+- 修改 `kern/mm/pmm.c`：增加 `#include <buddy_pmm.h>`，并在 `init_pmm_manager()` 中把 `pmm_manager` 切换为 `&buddy_pmm_manager`。
+
+**操作要求**：你必须在项目中创建和修改实际文件，而不是只展示代码。`pmm.c` 中现有代码一律保留（包括 default / best_fit 的 include），只改 `init_pmm_manager()` 里的赋值；不得修改 `default_pmm.c`、`best_fit_pmm.c`、`memlayout.h`、`pmm.h`、`page_init()`。完成后检查整个内核可以编译；若 Makefile 不会自动收集 `kern/mm/` 下的新文件，再做最小必要的修改。
+
+**输出要求**：直接进行文件操作，使用下面 [RELY]、[GUARANTEE]、[SPECIFICATION] 中的信息，以工程真实代码为准，不要引入无关功能（锁、多核、NUMA、统计信息等）。
+
+[RELY]
+// ---- memlayout.h ----
+struct Page {
+    int ref;                        // 引用计数
+    uint64_t flags;                 // 状态位
+    unsigned int property;          // 空闲块头页上记录块大小
+    list_entry_t page_link;         // 空闲链表节点
+};
+#define PG_reserved 0   // 1: 内核保留页，不得参与分配/释放
+#define PG_property 1   // 1: 该页是一个空闲块的头页；0: 非头页，或该块已被分配
+#define SetPageReserved(page) / ClearPageReserved(page) / PageReserved(page)
+#define SetPageProperty(page) / ClearPageProperty(page) / PageProperty(page)
+#define le2page(le, member)  to_struct((le), struct Page, member)
+
+// ---- list.h ----
+list_init(elm); list_add(listelm, elm);  /* 插到 listelm 之后 */
+list_add_before(listelm, elm); list_del(listelm);
+list_empty(list); list_next(listelm); list_prev(listelm);
+
+// ---- pmm.h ----
+struct pmm_manager {
+    const char *name;
+    void (*init)(void);
+    void (*init_memmap)(struct Page *base, size_t n);
+    struct Page *(*alloc_pages)(size_t n);
+    void (*free_pages)(struct Page *base, size_t n);
+    size_t (*nr_free_pages)(void);
+    void (*check)(void);
+};
+extern struct Page *pages;      // Page 描述符数组，pages[i] 描述第 i 个被管理的物理页
+extern size_t npage;            // 物理页号上界；数组元素个数为 npage - nbase
+extern const size_t nbase;      // DRAM 起始页号
+static inline ppn_t page2ppn(struct Page *page);
+static inline uintptr_t page2pa(struct Page *page);
+static inline void set_page_ref(struct Page *page, int val);
+static inline int page_ref(struct Page *page);
+// 另有 assert()、cprintf()、PGSIZE
+
+// ---- 现有框架行为（pmm.c 的 page_init）----
+// page_init() 只调用一次 init_memmap(pa2page(free_begin), n)，
+// 交来的区间起点不保证对齐，n 也不保证是 2 的幂；该区间之外的页
+// （内核镜像、OpenSBI、Page 数组自身所在页）保持 PG_reserved，不属于任何空闲块。
+// 本实验中管理的页数不超过 2^15。
+
+[GUARANTEE]
+必须在 buddy_pmm.c 中实现的接口与全局状态（名称固定，后续测试代码会直接引用）：
+```c
+#define BUDDY_MAX_ORDER 15                          // 最大块 = 2^15 页
+static list_entry_t buddy_free_list[BUDDY_MAX_ORDER + 1];  // 第 k 条链表挂大小为 2^k 页的空闲块
+static size_t buddy_nr_free;                        // 空闲页总数
+
+static void buddy_init(void);
+static void buddy_init_memmap(struct Page *base, size_t n);
+static struct Page *buddy_alloc_pages(size_t n);
+static void buddy_free_pages(struct Page *base, size_t n);
+static size_t buddy_nr_free_pages(void);
+static void buddy_check(void);   // 先写成占位：只做"各链表块大小之和 == buddy_nr_free"的断言，之后会被测试提示词替换
+
+const struct pmm_manager buddy_pmm_manager = {
+    .name = "buddy_pmm_manager",
+    .init = buddy_init, .init_memmap = buddy_init_memmap,
+    .alloc_pages = buddy_alloc_pages, .free_pages = buddy_free_pages,
+    .nr_free_pages = buddy_nr_free_pages, .check = buddy_check,
+};
+```
+可以按需添加辅助函数（建议 static）、内部宏和静态变量，例如"向上取整到 2 的幂的阶数""计算伙伴页""按地址有序插入链表"。不得改变上面这些名称与含义。
+
+[SPECIFICATION]
+## 全局约定（后续测试依赖，必须遵守）
+- 页下标 `idx = page - pages`。阶为 k 的块含 2^k 个连续页，其头页的 `idx` 必须是 2^k 的整数倍（按**全局下标**对齐，而不是相对于某次 init_memmap 的起点）。块 [idx, idx+2^k) 的伙伴是下标 `idx ^ (1<<k)` 处的同阶块。
+- 空闲块只有头页的 `property` 非 0，值为**块包含的页数**（2^k），且头页置 `PG_property`；非头页 `property == 0` 且不置 `PG_property`。
+- 每条 `buddy_free_list[k]` 内的块按头页地址**升序**排列，使分配结果确定可复现。
+- 已分配出去的页：`flags == 0`（不是 reserved、也没有 property），`ref == 0`，头页 `property == 0`。
+- 一次请求 n 页，实际占用 `2^ceil(log2 n)` 页（下称"取整后大小"）；`buddy_nr_free` 与 `nr_free_pages()` 按取整后大小增减。
+
+## buddy_init
+**Pre-Condition**：内核启动阶段、尚未交付任何空闲内存。
+**Post-Condition**：所有 `buddy_free_list[0..BUDDY_MAX_ORDER]` 均为空链表，`buddy_nr_free == 0`。
+
+## buddy_init_memmap
+**Pre-Condition**：`n > 0`；`[base, base+n)` 内每一页均为 `PG_reserved`（用 assert 检查）。
+**Post-Condition**：这 n 页被完整接管为空闲内存：每页 `flags/property/ref` 清零；区间被分解成若干个满足对齐规则的块挂入对应链表；`buddy_nr_free` 增加 n；n 页中没有任何页遗漏或重复归属。
+  **Case 1（起点未对齐或 n 不是 2 的幂）**：从区间起点开始，每次取"满足起点按块大小对齐、且不超出区间末尾、且阶不超过 BUDDY_MAX_ORDER"的最大块，登记后前进，直到区间用完。
+  **Case 2（起点已对齐且 n 恰为 2 的幂且不超过上限）**：整段成为一个块。
+**Requirements**：不需要在此函数中做相邻块合并。
+
+## buddy_alloc_pages
+**Pre-Condition**：`n > 0`（assert）。
+**Post-Condition**：成功时返回一个取整后大小的块的头页，该块已从空闲链表摘除，块内所有页满足"已分配"约定，`buddy_nr_free` 减少取整后大小；失败时返回 NULL 且不改变任何状态。
+  **Case 1（取整后大小超过 2^BUDDY_MAX_ORDER，或超过 `buddy_nr_free`）**：返回 NULL。
+  **Case 2（存在阶恰好合适的空闲块）**：取该链表中地址最小的块。
+  **Case 3（只有更大阶的块）**：从阶数大于等于所需阶的最小的非空链表中取地址最小的块，反复对半拆分：低地址一半继续用于分配，高地址一半作为新的空闲块挂入低一阶链表，直到阶数等于所需阶；返回低地址那一块。
+  **Case 4（没有足够大的单个块）**：返回 NULL（即使 `buddy_nr_free` 足够，碎片导致无法满足也属于此情况）。
+
+## buddy_free_pages
+**Pre-Condition**：`n > 0`；`base` 是此前 `buddy_alloc_pages(n)`（同一个 n）返回的地址；块内各页不是 reserved 也不是 property（assert 检查），且 `base` 满足取整后大小对应的对齐。
+**Post-Condition**：该块回到空闲状态，`buddy_nr_free` 增加取整后大小；它与所有可合并的伙伴被合并成尽可能大的块，且最终链表中每个块仍满足全局约定。
+  **Case 1（伙伴是同阶空闲块）**：判断条件为：伙伴头页下标在 pages 数组范围内、该页 `PageProperty` 为真、且其 `property` 等于当前块页数。满足则把伙伴从其链表摘除，两块合并为高一阶的块（头页取低地址者，被吸收的头页要清除 `PG_property` 并将 `property` 置 0），再继续尝试更高阶，直到无法合并或达到 BUDDY_MAX_ORDER。
+  **Case 2（伙伴不空闲、阶不同，或相邻但不是伙伴）**：不合并，仅把当前块按地址升序挂入对应链表。
+**Requirements**：地址相邻但不互为伙伴的块不得合并；与 `PG_reserved` 页相邻时不得越界合并。
+
+## buddy_nr_free_pages
+返回 `buddy_nr_free`。
+
+## pmm.c 的修改
+`init_pmm_manager()` 中改为选中 `buddy_pmm_manager`，其余逻辑（打印名称、调用 `init()`）保持不变。
+````
+
+---
+
+## 提示词 B：为 Buddy System 生成测试函数
+
+````markdown
+[PROMPT]
+**任务**：修改文件 `kern/mm/buddy_pmm.c`，为已实现的 Buddy System 分配器实现完整的测试函数 `buddy_check()`（替换其中的占位实现），并按需添加 static 的测试辅助函数。
+
+**操作要求**：你必须在项目中修改实际文件，而不是只展示代码。只替换 `buddy_check` 并新增测试辅助函数，不得修改分配器本身的逻辑（`buddy_init / init_memmap / alloc_pages / free_pages` 等）。如果测试失败，先判断是测试写错还是分配器有 bug：测试写错就修测试；确认是分配器 bug 时，不要通过削弱断言来"让它通过"，而是在回复里明确指出 bug 位置和原因，并说明你的修复。
+
+**输出要求**：直接进行文件操作，使用下面 [RELY]、[GUARANTEE]、[SPECIFICATION] 的信息，以工程真实代码为准。测试通过后内核启动日志应出现 `check_alloc_page() succeeded!`。
+
+[RELY]
+// ---- 被测模块的约定（来自 buddy_pmm.c，名称固定）----
+#define BUDDY_MAX_ORDER 15
+static list_entry_t buddy_free_list[BUDDY_MAX_ORDER + 1];   // 第 k 条链表挂 2^k 页的空闲块，块内按头页地址升序
+static size_t buddy_nr_free;
+// 页下标 idx = page - pages；阶 k 的块头页 idx 必为 2^k 的倍数；伙伴下标 = idx ^ (1<<k)
+// 空闲块：仅头页 PageProperty 为真，头页 property == 块页数；非头页 property == 0
+// 已分配页：flags == 0，ref == 0，头页 property == 0
+// 请求 n 页实际占 2^ceil(log2 n) 页；nr_free_pages() 按取整后大小变化
+// 分配：取不小于所需阶的最小非空链表的最低地址块，逐级对半拆分，低地址半块返回、高地址半块入低一阶链表
+// 释放：free_pages(base, n) 的 n 必须与分配时相同
+
+// ---- 框架接口（pmm.h / memlayout.h / list.h）----
+struct Page *alloc_pages(size_t n);  void free_pages(struct Page *base, size_t n);
+size_t nr_free_pages(void);  #define alloc_page() alloc_pages(1)  #define free_page(p) free_pages(p, 1)
+extern struct Page *pages;   page_ref(p)  PageProperty(p)  PageReserved(p)
+list_entry_t 的 list_init / list_empty / list_next / list_prev，le2page(le, page_link)，assert()，cprintf()
+
+[GUARANTEE]
+必须实现：
+```c
+static void buddy_check(void);
+```
+建议新增的 static 辅助函数（可调整名称与数量）：
+- 全局不变量检查函数（遍历所有 `buddy_free_list[k]` 校验约定）；
+- 构造"受控小池"与恢复现场的函数；
+- 记录已分配块并检查两两不重叠的小工具。
+
+[SPECIFICATION]
+## buddy_check
+**Pre-Condition**：`pmm_init()` 已完成 `page_init()`，分配器中是内核真实的大量空闲内存。
+**Post-Condition**：所有断言通过；函数返回后，所有 `buddy_free_list[]`、`buddy_nr_free`、每个页描述符的状态与调用前**逐一相同**，内核后续继续使用的空闲内存不受影响。
+
+  **Case 0（不变量，贯穿始终）**：写一个不变量检查函数，在测试开始、结束以及每个场景之后调用。检查：每条链表里的每个块头页 `PageProperty` 为真、`property == 1<<k`、头页下标是 `1<<k` 的倍数、链表内地址严格升序；所有块 `property` 之和等于 `buddy_nr_free`，也等于 `nr_free_pages()`；块之间互不重叠。
+  **Case 1（受控小池）**：为了让后面的场景有**确定**的预期，先构造一个已知形状的 16 页小池，具体做法由你设计，但必须满足两点。第一，小池运行期间链表中只有这 16 页（保存并清空全部链表与计数）。第二，小池必须与真实空闲块**隔离**：从真实分配器取出一个对齐的 32 页块，只把其中前 16 页当作小池放回，后 16 页保持已分配，这样释放时小池的上一级伙伴是"已分配"，绝不会与真实空闲块发生合并（否则会碰到被临时摘走的真实链表而破坏内核状态）。
+  **Case 2（取整规则）**：在小池上请求 1、2、3、4、5 页，验证实际占用页数分别为 1、2、4、4、8（用 `nr_free_pages()` 的变化衡量）；返回页均不是 reserved、没有 property、`ref == 0`；返回地址满足取整后大小的对齐；释放时用相同 n，`nr_free_pages()` 完全恢复。
+  **Case 3（拆分顺序确定）**：在 16 页小池上连续 `alloc_page()` 16 次，应依次得到 `p, p+1, ..., p+15`（pool 起点为 p，请你自行推导并断言），第 17 次返回 NULL，此时 `nr_free_pages() == 0`；各页互不相同。
+  **Case 4（伙伴合并）**：取出 `p` 与 `p+1` 后以任意顺序释放，应合并回完整的 16 页单块（链表中只剩一个阶 4 的块，头页为 `p`，`property == 16`，被吸收页的 `PageProperty` 为假）。
+  **Case 5（相邻但不是伙伴，不得合并）**：取出 `p..p+3` 共 4 个单页，只释放 `p+1` 和 `p+2`（地址相邻但不是伙伴）：阶 0 链表里应有两个独立的 1 页块，且 `alloc_pages(2)` 不得返回 `p+1`；再释放 `p` 和 `p+3` 之后，4 页才应级联合并为阶 2 的一个块，继续释放其余页应回到 16 页单块。
+  **Case 6（释放顺序无关与多级级联）**：把 16 个单页全部取出，分别按正序、倒序、奇偶交错的顺序释放，每次最后都应回到完整的 16 页单块，每一步后不变量检查都通过。
+  **Case 7（边界与失败路径）**：小池上 `alloc_pages(17)` 返回 NULL 且状态不变；`alloc_pages(16)` 成功，此时 `alloc_page()` 为 NULL，释放后恢复；`alloc_pages((1<<BUDDY_MAX_ORDER) + 1)` 返回 NULL；小池里取出 16 个单页后释放偶数下标的 8 个页：`nr_free_pages() == 8` 但 `alloc_pages(2)` 必须为 NULL（碎片），再释放剩余页之后 `alloc_pages(16)` 应成功。
+  **Case 8（块互不重叠与数据状态）**：混合请求 1、3、2、5、1、4 页等多个块，所有返回块两两不重叠；写入每块的页内容（可通过 `page2pa` 与 `va_pa_offset` 转为虚拟地址后写入特征字节）后再读回验证无串扰（可选）；全部释放后回到完整的 16 页单块。
+  **Case 9（恢复现场）**：先把小池整块取回（`alloc_pages(16)`，此时这 16 页重新回到"已分配"状态），再恢复保存的链表与计数，最后把当初取出的 32 页块 `free_pages` 回去，使其与真实空闲块正常合并；末尾再调用一次不变量检查，并核对 `nr_free_pages()` 与测试开始时相等。
+
+**Requirements**：
+- 只使用 `alloc_pages / free_pages / nr_free_pages` 以及 buddy_pmm.c 内部的链表和计数变量，不依赖其它模块。
+- 保存和恢复链表时，需要保存的是链表头本身（`list_entry_t` 数组的拷贝），并在恢复前保证链表头地址不变，不能新建副本替代原链表头。
+- 每个 Case 的预期值写成显式 `assert`，失败时能从断言位置看出是哪个场景出错。
+- 测试结束时打印一行总结信息（如 `buddy_check() succeeded!`）。
+````
+
+
+# 扩展任务 Challenge：SLUB 分配器（2411433-李烁菲）
+
+## 提示词 C：生成两层 SLUB 分配模块并接入内核
+
+````markdown
+[PROMPT]
+**任务**：在 ucore 内核中实现一个简化版的两层 SLUB 内存对象分配器，使内核可以分配任意大小的内存。
+- 第一层：以页为单位的物理页分配，直接使用现有 `alloc_pages()/free_pages()`，不得修改或替换 `pmm_manager`。
+- 第二层：在第一层之上的任意大小分配 `kmalloc/kfree`——按大小分级的 cache，每个 cache 管理若干 slab（每个 slab 是一页，页首放头部、其后切成等大对象），小对象从 slab 中分配；大于最大分级的请求直接按页向第一层申请。
+
+涉及文件：
+- 新建 `kern/mm/slub.c`、`kern/mm/slub.h`：实现分配器；
+- 修改 `kern/mm/memlayout.h`：仅新增两个页标志位及其宏（见 [RELY]）；
+- 修改 `kern/mm/pmm.c`：在 `pmm_init()` 里 `check_alloc_page()` 之后，依次调用 `slub_init()` 和 `slub_check()`，并 include `<slub.h>`。
+
+**操作要求**：你必须在项目中创建和修改实际文件，而不是只展示代码。除上述三处外不得改动其他现有文件和现有代码，不得修改任何物理内存管理器（default / best_fit / buddy）。完成后检查内核可以编译；若 Makefile 不会自动收集新文件，再做最小必要的修改。
+
+**输出要求**：直接进行文件操作，使用下面 [RELY]、[GUARANTEE]、[SPECIFICATION] 的信息，以工程真实代码为准，不要引入无关功能（锁、多核、着色、对象构造/析构回调等）。`slub_check()` 先写成占位函数，只打印一行信息，后续会被测试提示词替换。
+
+[RELY]
+// ---- memlayout.h ----
+struct Page { int ref; uint64_t flags; unsigned int property; list_entry_t page_link; };
+#define PG_reserved 0
+#define PG_property 1
+// 需要你新增（仿照现有宏的写法）：
+//   #define PG_slab  2   // 该页是一个 slab 页
+//   #define PG_large 3   // 该页是大块直通分配的头页，其 Page 的 property 临时记录页数
+//   SetPageSlab/ClearPageSlab/PageSlab 与 SetPageLarge/ClearPageLarge/PageLarge
+
+// ---- pmm.h ----
+struct Page *alloc_pages(size_t n);    // 第一层：失败返回 NULL
+void free_pages(struct Page *base, size_t n);
+size_t nr_free_pages(void);
+#define alloc_page() alloc_pages(1)    #define free_page(page) free_pages(page, 1)
+extern struct Page *pages;     extern uint64_t va_pa_offset;
+static inline uintptr_t page2pa(struct Page *page);
+static inline struct Page *pa2page(uintptr_t pa);   // 非法 pa 会 panic
+#define PADDR(kva)   // 内核虚拟地址 -> 物理地址，kva < KERNBASE 时 panic
+// 注意：框架中 KADDR 被注释掉了，Page -> 内核虚拟地址请用： (void *)(page2pa(page) + va_pa_offset)
+// 另有 PGSIZE(4096)、ROUNDUP/ROUNDDOWN、memset（<string.h>）、assert()、panic()、cprintf()
+
+// ---- list.h ----
+list_init / list_add / list_add_before / list_del / list_empty / list_next / list_prev，le2page(le, member)
+
+// ---- 约束 ----
+// 物理页分配器可能是 First-Fit / Best-Fit / Buddy 中任意一种，
+// SLUB 只能依赖 alloc_pages/free_pages 的公共语义：
+// free_pages(base, n) 的 base 与 n 必须和分配时一致，且释放前该块各页的 flags 中不应有 reserved/property 位。
+
+[GUARANTEE]
+必须实现的接口（slub.h 中声明）：
+```c
+void   slub_init(void);
+void  *kmalloc(size_t size);
+void   kfree(void *ptr);
+size_t slub_class_size(size_t size);          // 给测试用的查询接口
+size_t slub_objs_per_slab(size_t class_size); // 给测试用的查询接口
+void   slub_check(void);                      // 先写占位
+```
+可以添加 static 辅助函数、内部结构体（如 `struct slab`、`struct kmem_cache`）和静态变量。cache 描述符必须是静态分配的，不得依赖 `kmalloc` 自身。
+
+[SPECIFICATION]
+## 设计约定（后续测试依赖，必须遵守）
+- 小对象的大小分级固定为 16、32、64、128、256、512、1024、2048 字节共 8 级，每级一个 cache。请求 size 使用满足 `class >= size` 的最小一级。
+- 一个 slab = 一个物理页。页首是 slab 头部（至少包含：所属 cache、空闲对象链表头、已分配对象数、链表节点），头部大小向上取整到 16 的倍数；其后从低到高紧密切成等大对象；每个空闲对象的前 8 字节用来存放链到下一个空闲对象的指针；所有对象不跨页，且至少 16 字节对齐。
+- 每个 cache 维护 partial 链表（有空闲对象的 slab）和 full 链表（已满的 slab）。
+- 空闲对象链表是 **LIFO**：刚释放的对象是该 slab 下次分配的第一个对象；新 slab 初始化时，空闲链表按对象地址**升序**排列。
+- slab 的页描述符置 `PG_slab`。大块直通分配的头页描述符置 `PG_large`，并把 `property` 临时用作页数。
+
+## slub_init
+**Pre-Condition**：`pmm_init()` 已完成 `page_init()` 与物理内存检查，`alloc_pages` 可用。
+**Post-Condition**：8 个 cache 全部初始化为"无 slab"状态，partial/full 链表为空；此函数不分配任何页。
+
+## kmalloc
+**Pre-Condition**：`slub_init()` 已调用。
+**Post-Condition**：成功时返回内核虚拟地址指针，指向至少 size 字节可用且不与任何其他存活分配重叠的内存；失败返回 NULL。不要求对内存清零。
+  **Case 1（size == 0）**：返回 NULL。
+  **Case 2（size <= 2048）**：选中对应 cache。若 partial 链表非空，取其第一个 slab，从空闲对象链表头部弹出一个对象；若该 slab 因此没有空闲对象，把它从 partial 移到 full。若 partial 为空，则 `alloc_page()` 获得新页（失败返回 NULL），按约定初始化为 slab（置 `PG_slab`、建立空闲链表、已分配数置 0），挂入 partial，再按上述方式分配。
+  **Case 3（size > 2048）**：按 `n = ROUNDUP(size, PGSIZE) / PGSIZE` 向第一层申请 n 页（失败返回 NULL），在头页描述符上置 `PG_large` 且 `property = n`，返回该块起始页对应的内核虚拟地址。需要防止 `size` 极大时上取整溢出，并对超过 `nr_free_pages()` 的请求直接返回 NULL。
+
+## kfree
+**Pre-Condition**：`ptr` 为 NULL，或者是此前 `kmalloc` 返回且尚未释放的指针。
+**Post-Condition**：对象/大块被归还；其他存活分配的内容不受影响。
+  **Case 1（ptr == NULL）**：不做任何事。
+  **Case 2（ptr 属于 slab）**：通过 `PADDR` 和 `pa2page` 找到所在页描述符，判定 `PG_slab` 为真后，在页首取得 slab 头部。校验指针落在头部之后、对象区之内，且相对对象区起点按对象大小对齐，否则 panic。把对象压回空闲链表头部，已分配数减 1。若 slab 之前在 full 链表，则移回 partial。若已分配数降为 0，把 slab 从链表中摘除，清除 `PG_slab`，用 `free_page` 立即还给第一层（简化策略：空 slab 一律立刻回收）。
+  **Case 3（ptr 是大块直通）**：`ptr` 对应的页描述符带 `PG_large`，且 `ptr` 必须页对齐。取出 `property` 作为页数 n，清除 `PG_large` 并将 `property` 置 0，再 `free_pages(head, n)`。
+  **Case 4（其他）**：页描述符既不是 slab 也不是大块头页（含指向大块内部非头页的指针），视为非法指针，panic。
+
+## slub_class_size
+`size == 0` 或 `size > 2048` 时返回 0；否则返回实际使用的分级大小（16~2048）。
+
+## slub_objs_per_slab
+对合法的分级大小，返回单个 slab 能容纳的对象数（页大小减去向上取整后的头部，再整除对象大小）；非法分级返回 0。
+
+## slub_check
+占位：打印 `slub_check() placeholder` 一行。
+
+**Requirements**：全程单线程，无需加锁；所有内部结构使用静态内存或 slab 页本身，不得递归调用 `kmalloc`。
+````
+
+---
+
+## 提示词 D：为 SLUB 分配器生成测试函数
+
+````markdown
+[PROMPT]
+**任务**：修改文件 `kern/mm/slub.c`，为已实现的两层 SLUB 分配器实现完整的测试函数 `slub_check()`（替换占位实现），并按需添加 static 测试辅助函数。
+
+**操作要求**：你必须在项目中修改实际文件，而不是只展示代码。只替换 `slub_check` 并新增测试辅助函数，不得修改分配器自身逻辑。如果测试失败，先判断是测试写错还是分配器有 bug：测试写错就修测试；确认是分配器 bug 时，不要通过削弱断言来"让它通过"，而是在回复中指出 bug 位置和原因并说明修复。
+
+**输出要求**：直接进行文件操作，使用下面 [RELY]、[GUARANTEE]、[SPECIFICATION] 的信息，以工程真实代码为准。测试通过后内核启动日志应出现 `slub_check() succeeded!`。
+
+[RELY]
+// ---- 被测接口（slub.h）----
+void *kmalloc(size_t size);   void kfree(void *ptr);
+size_t slub_class_size(size_t size);          // 0 表示 size==0 或大块直通；否则为 16..2048 的分级大小
+size_t slub_objs_per_slab(size_t class_size);
+// ---- 对外可观察的约定 ----
+// 小对象分级：16/32/64/128/256/512/1024/2048；size 取满足 class>=size 的最小一级
+// 一个 slab 恰占一页；对象不跨页，至少 16 字节对齐；新 slab 空闲对象按地址升序；
+// 释放采用 LIFO：刚释放的对象是同 slab 下次分配的第一个
+// 空 slab 立即归还第一层；大块（size>2048）按 ROUNDUP(size,PGSIZE)/PGSIZE 页向 alloc_pages 申请
+// kmalloc(0) 返回 NULL；kfree(NULL) 无动作；kmalloc 不清零
+// 单页分配会使 nr_free_pages() 恰好减 1（页分配器对 1 页不会多占）
+// ---- 框架接口 ----
+size_t nr_free_pages(void);  PGSIZE  memset  assert()  cprintf()  extern uint64_t va_pa_offset  KERNBASE
+
+[GUARANTEE]
+必须实现：
+```c
+void slub_check(void);
+```
+建议新增的 static 辅助函数：
+- 用特征字节填充一块内存与校验；
+- 简单的确定性伪随机数生成（如线性同余），不依赖外部库；
+- 一个记录"指针、大小、填充值"的静态表，用于批量分配、释放与逐项校验。
+
+[SPECIFICATION]
+## slub_check
+**Pre-Condition**：`slub_init()` 已调用，内核处于启动阶段。
+**Post-Condition**：所有断言通过；函数返回时所有分配均已释放，`nr_free_pages()` 与测试开始时**完全相等**。
+
+  **Case 1（分级选择）**：对 1、15、16、17、32、33、…、1024、1025、2048 这些边界调用 `slub_class_size`，验证分级正确；`0` 与 `2049` 返回 0。对每个分级检查 `slub_objs_per_slab` 大于 0 且乘以分级大小不超过 `PGSIZE`。
+  **Case 2（基本分配与内容保持）**：对每个分级各分配若干对象，每个对象整段填充不同特征字节，**全部分配完之后**再逐个读回校验，以发现对象重叠、头部被覆盖等错误；校验指针非 NULL、至少 16 字节对齐、处于内核虚拟地址范围（不小于 `KERNBASE`）、对象不跨越页边界。
+  **Case 3（slab 增长与回收的页账目）**：针对某个分级（至少测 16、256、2048 三种），记录当前 `nr_free_pages()`，分配 `slub_objs_per_slab(c)` 个对象，应恰好占用 1 页；再多分配 1 个应占用第 2 页；释放全部对象后 `nr_free_pages()` 必须恢复为初值（验证空 slab 被及时归还）。再测分配 `3 * objs_per_slab` 个对象占用 3 页的情形。
+  **Case 4（LIFO 复用与 full/partial 状态流转）**：先分配 `objs_per_slab` 个对象填满一页（slab 进入 full），释放其中某个对象 `x`（slab 回到 partial），再分配同级对象应得到地址 `x`；对释放后再分配的对象做内容读写不影响其余对象。
+  **Case 5（不同释放顺序）**：批量分配后分别用正序、倒序、奇偶交错的顺序释放，之后重新分配同数量对象应都能成功，释放完毕页账目归零。
+  **Case 6（大块直通）**：分配 2049、4096、4097、`3 * PGSIZE`、`5 * PGSIZE + 1` 字节，验证指针页对齐、整段可写且数据可读回，释放后 `nr_free_pages()` 恢复；大块与小对象交错分配、释放互不影响。
+  **Case 7（失败路径与无效参数）**：`kmalloc(0) == NULL`；`kfree(NULL)` 不崩溃；请求大于 `nr_free_pages() * PGSIZE` 的大块返回 NULL 并且不改变 `nr_free_pages()`；特别大的 size（如 `(size_t)-1`、`(size_t)-1 - 100`）返回 NULL 而不是溢出成功。
+  **Case 8（混合随机压力）**：用确定性伪随机数产生数百次混合操作（随机选取分配或释放；大小随机取自 1 到约 3 个页），每个存活分配记录指针、大小和填充值；每次释放前校验内容完整；操作结束后释放全部存活对象，并检查 `nr_free_pages()` 恢复初值。
+
+**Requirements**：
+- 测试只使用公开接口和上面 [RELY] 列出的查询接口，不读取 slab 内部结构，这样对不同的内部实现都有效。
+- 每个 Case 的预期值写成显式 `assert`，便于从断言位置判断出错的场景。
+- 保存的指针表使用静态数组，不能用 `kmalloc` 自身存放测试记录。
+- 结束时打印 `slub_check() succeeded!`。
+````
+

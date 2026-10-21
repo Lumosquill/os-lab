@@ -42,12 +42,21 @@ struct Page {
 #define PG_reserved                 0       // if this bit=1: the Page is reserved for kernel, cannot be used in alloc/free_pages; otherwise, this bit=0 
 #define PG_property                 1       // if this bit=1: the Page is the head page of a free memory block(contains some continuous_addrress pages), and can be used in alloc_pages; if this bit=0: if the Page is the the head page of a free memory block, then this Page and the memory block is alloced. Or this Page isn't the head page.
 
+#define PG_slab                     2       // if this bit=1: the Page is a slab page owned by the SLUB allocator (kern/mm/slub.c)
+#define PG_large                    3       // if this bit=1: the Page is the head page of a large block handed out by kmalloc (size > 2048); Page.property temporarily records its page count
+
 #define SetPageReserved(page)       ((page)->flags |= (1UL << PG_reserved))
 #define ClearPageReserved(page)     ((page)->flags &= ~(1UL << PG_reserved))
 #define PageReserved(page)          (((page)->flags >> PG_reserved) & 1)
 #define SetPageProperty(page)       ((page)->flags |= (1UL << PG_property))
 #define ClearPageProperty(page)     ((page)->flags &= ~(1UL << PG_property))
 #define PageProperty(page)          (((page)->flags >> PG_property) & 1)
+#define SetPageSlab(page)           ((page)->flags |= (1UL << PG_slab))
+#define ClearPageSlab(page)         ((page)->flags &= ~(1UL << PG_slab))
+#define PageSlab(page)              (((page)->flags >> PG_slab) & 1)
+#define SetPageLarge(page)          ((page)->flags |= (1UL << PG_large))
+#define ClearPageLarge(page)        ((page)->flags &= ~(1UL << PG_large))
+#define PageLarge(page)             (((page)->flags >> PG_large) & 1)
 
 // convert list entry to page
 #define le2page(le, member)                 \
