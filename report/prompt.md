@@ -265,7 +265,9 @@ const struct pmm_manager best_fit_pmm_manager;   // pmm.h 之外另需 extern �
 - 不允许为了通过测试而修改、关闭或绕过 assert。
 ````
 
-任务三：Buddy System（2411433-李烁菲）
+
+
+### 2411433-李烁菲
 
 ## 提示词 A：生成 Buddy System 分配模块并接入内核
 
@@ -452,7 +454,6 @@ static void buddy_check(void);
 ````
 
 
-# 扩展任务 Challenge：SLUB 分配器（2411433-李烁菲）
 
 ## 提示词 C：生成两层 SLUB 分配模块并接入内核
 
