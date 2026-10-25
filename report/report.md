@@ -6,15 +6,15 @@
 | -------- | ----------------------------------- |
 | **实验名称** | Lab 2: 物理内存和页表                      |
 | **小组成员** | 2411570-何美璇、2410699-张欣妍、2411433-李烁菲 |
-| **完成日期** | 2026-10-21                            |
+| **完成日期** | 2026-10-22                            |
 
 ### 小组分工
 
-| 成员           | 负责的练习/模块                                            | 负责的实验报告模块                                           |
-| -------------- | ---------------------------------------------------------- | ------------------------------------------------------------ |
-| 2411570-何美璇 | 功能模块一（任务一、扩展任务 Challenge）；分支任务-GDB调试 | 一、实验目的；三、实验整体逻辑分析；四、实验内容与实现（功能模块一（任务一、扩展任务 Challenge）、GDB 分支任务）；六的对应部分 |
-| 2410699-张欣妍 | 功能模块二（任务一 First-Fit 分析、任务二 Best-Fit 实现）  | 二、实验环境；四、实验内容与实现（功能模块二 任务一、任务二）；六（知识点对照补充、成员B感悟） |
-| 2411433-李烁菲 | 功能模块二（任务三 Buddy System）；扩展任务 Challenge-SLUB | 四、实验内容与实现（功能模块三、扩展任务slub）；五、运行验证的截图分析；六的对应部分 |
+| 成员          | 负责的练习/模块                                    | 负责的实验报告模块                                                       |
+| ----------- | ------------------------------------------- | --------------------------------------------------------------- |
+| 2411570-何美璇 | 功能模块一（任务一、扩展任务 Challenge）；分支任务-GDB调试        | 一、实验目的；三、实验整体逻辑分析；四、实验内容与实现（功能模块一（任务一、扩展任务 Challenge）、GDB 分支任务） |
+| 2410699-张欣妍 | 功能模块二（任务一 First-Fit 分析、任务二 Best-Fit 实现）     | 二、实验环境；四、实验内容与实现（功能模块二 任务一、任务二）；六（知识点对照补充、成员B感悟）                |
+| 2411433-李烁菲 | 功能模块二（任务三 Buddy System）；扩展任务 Challenge-SLUB |  四、实验内容与实现（功能模块三、扩展任务slub）；五、运行验证的截图分析；六的对应部分                              |
 
 ***
 
@@ -233,6 +233,7 @@ static void page_init(void) {
     if (free_begin < free_end) {
         init_memmap(pa2page(free_begin), (free_end - free_begin) / PGSIZE);
     }
+}
 
 ```
 
@@ -1086,13 +1087,11 @@ const struct pmm_manager best_fit_pmm_manager;   // pmm.h 之外另需 extern �
 6. **没有局部性与并发考虑**：可以加 per-CPU 缓存（多数分配不必进全局链表）与 NUMA 亲和性；本实验是单核、关中断的原子上下文。
 
 
-在实验报告中，为了既体现代码的实现细节，又能展示你对内核机制的掌控，建议采用“**逻辑概览 + 代码片段 + 设计决策**”的组织方式。以下是针对任务三和扩展任务的报告范例。
-
 ---
 
 
 ### 功能模块三：Buddy System 分配器实现
-**负责人**：241433-李烁菲
+**负责人**：2411433-李烁菲
 
 **1. 实现思路与设计决策**
 Buddy System 的核心难点在于内存块的对齐与递归合并。为了满足 [SPECIFICATION] 中的契约，本模块设计如下：
@@ -1262,7 +1261,7 @@ buddy_insert_block(pages + idx, order);
 
 
 ### 扩展任务：SLUB 分配器实现
-**负责人**：241433-李烁菲
+**负责人**：2411433-李烁菲
 
 **1. 实现思路与设计决策**
 SLUB 分配器实现了从物理页到内存对象的两层抽象：
@@ -1437,31 +1436,27 @@ SLUB 的测试核心在于验证“slab 增长”与“空闲对象复用”的�
 
 ## 五、测试与验证
 
-<!-- 根据该实验的具体情况，提供完整的测试运行截图，应包含：
-
-- 编译及运行成功的输出（make qemu），可能有多个
-- 测试通过的结果（make grade），只有一个
-
-\-->
-
 **测试截图：**
 
 **运行验证 `make qemu`（QEMU 4.1.1 + Best-Fit）：**
 
 ![make qemu 运行输出：OpenSBI v0.4、best_fit_pmm_manager、check_alloc_page() succeeded!](./images/B_bestfit_qemu.png)
 
+> 本图是修复 `init_pmm_manager()` 后的最终 Best-Fit 构建；`slub_check()` 是选做 Challenge 的自检。
+
 **评分 `make grade`：**
 
 ![make grade：check page init OK、check best fit OK、Total Score 20/20](./images/B_grade.png)
 
-接下来是buddy与slub的验证，
-如图所示，内核成功挂载了 `buddy_pmm_manager`，并通过了 Buddy System 和 SLUB 分配器的全部自检逻辑：
+> 本图是最终 Best-Fit 构建的评分结果；编译行包含 `buddy_pmm.c`、`slub.c`。
 
-![Buddy 与 SLUB 分配器运行结果](images/buddy+slub.png)
+接下来是选做 Buddy/SLUB 的验证。需要说明：**最终提交的 `pmm_manager` 是 `best_fit_pmm_manager`**（见上面的 20/20 评分图与 `make qemu` 图）；下图是**临时把 `pmm_manager` 切换为 `buddy_pmm_manager`** 验证选做任务时的输出，验证完已切回 Best-Fit，因此最终 `make qemu` 不再打印 `buddy_check()`。
+
+![临时切换 Buddy 时的运行结果](images/buddy+slub.png)
 
 #### 1. 系统初始化与内存布局
  **内存探测**：`physical memory map: memory: 0x0000000008000000, [0x0000000080000000, 0x0000000087ffffff]` 表明系统已正确探测到 128MB 的物理内存，且地址范围覆盖了从 `0x80000000` 到 `0x87ffffff` 的有效区域。
-**管理器切换**：`memory management: buddy_pmm_manager` 明确显示内核已成功将内存管理策略切换为伙伴系统，验证了 `init_pmm_manager()` 中的配置逻辑正确。
+**管理器切换（仅本次临时验证）**：`memory management: buddy_pmm_manager` 说明临时切换生效；最终提交已切回 `best_fit_pmm_manager`，以 `make grade` 的 20/20 为准。
 
 #### 2. 自检功能验证（关键验证点）
  **Buddy System 自检**：`buddy_check() succeeded!` 表明伙伴系统的分配与合并逻辑（包含拆分、级联合并、边界检查等）在真实内存环境下运行正常，未出现内存重叠或账目错误。

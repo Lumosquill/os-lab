@@ -37,7 +37,8 @@ static void check_alloc_page(void);
 // init_pmm_manager - initialize a pmm_manager instance
 static void init_pmm_manager(void) {
     //lab2 任务三 学号：2411433：切换为 Buddy System 连续物理内存分配算法
-    pmm_manager = &buddy_pmm_manager;
+    //lab2 任务二 学号：2410699：最终提交使用 Best-Fit（Buddy 仅用于选做验证）
+    pmm_manager = &best_fit_pmm_manager;
     cprintf("memory management: %s\n", pmm_manager->name);
     pmm_manager->init();
 }
