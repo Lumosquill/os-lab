@@ -328,7 +328,6 @@ static inline int page_ref(struct Page *page);
 
 [GUARANTEE]
 必须在 buddy_pmm.c 中实现的接口与全局状态（名称固定，后续测试代码会直接引用）：
-```c
 #define BUDDY_MAX_ORDER 15                          // 最大块 = 2^15 页
 static list_entry_t buddy_free_list[BUDDY_MAX_ORDER + 1];  // 第 k 条链表挂大小为 2^k 页的空闲块
 static size_t buddy_nr_free;                        // 空闲页总数
@@ -346,7 +345,6 @@ const struct pmm_manager buddy_pmm_manager = {
     .alloc_pages = buddy_alloc_pages, .free_pages = buddy_free_pages,
     .nr_free_pages = buddy_nr_free_pages, .check = buddy_check,
 };
-```
 可以按需添加辅助函数（建议 static）、内部宏和静态变量，例如"向上取整到 2 的幂的阶数""计算伙伴页""按地址有序插入链表"。不得改变上面这些名称与含义。
 
 [SPECIFICATION]
@@ -421,10 +419,7 @@ extern struct Page *pages;   page_ref(p)  PageProperty(p)  PageReserved(p)
 list_entry_t 的 list_init / list_empty / list_next / list_prev，le2page(le, page_link)，assert()，cprintf()
 
 [GUARANTEE]
-必须实现：
-```c
-static void buddy_check(void);
-```
+必须实现：static void buddy_check(void);
 建议新增的 static 辅助函数（可调整名称与数量）：
 - 全局不变量检查函数（遍历所有 `buddy_free_list[k]` 校验约定）；
 - 构造"受控小池"与恢复现场的函数；
@@ -504,14 +499,13 @@ list_init / list_add / list_add_before / list_del / list_empty / list_next / lis
 
 [GUARANTEE]
 必须实现的接口（slub.h 中声明）：
-```c
 void   slub_init(void);
 void  *kmalloc(size_t size);
 void   kfree(void *ptr);
 size_t slub_class_size(size_t size);          // 给测试用的查询接口
 size_t slub_objs_per_slab(size_t class_size); // 给测试用的查询接口
 void   slub_check(void);                      // 先写占位
-```
+
 可以添加 static 辅助函数、内部结构体（如 `struct slab`、`struct kmem_cache`）和静态变量。cache 描述符必须是静态分配的，不得依赖 `kmalloc` 自身。
 
 [SPECIFICATION]
@@ -582,9 +576,8 @@ size_t nr_free_pages(void);  PGSIZE  memset  assert()  cprintf()  extern uint64_
 
 [GUARANTEE]
 必须实现：
-```c
 void slub_check(void);
-```
+
 建议新增的 static 辅助函数：
 - 用特征字节填充一块内存与校验；
 - 简单的确定性伪随机数生成（如线性同余），不依赖外部库；
