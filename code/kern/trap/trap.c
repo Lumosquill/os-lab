@@ -80,7 +80,38 @@ void print_regs(struct pushregs *gpr) {
     cprintf("  t6       0x%08x\n", gpr->t6);
 }
 
-//lab3 function2 YOUR CODE
+//lab3 function2 2410699 & 2411570
+// 返回触发异常的那条指令的字节数：低两位为 11 是 4 字节指令，否则是 2 字节压缩指令。
+// 只读 16 位，避免读到指令之外的内存。
+static size_t insn_length(uintptr_t addr) {
+    uint16_t low = *(volatile uint16_t *)addr;
+    return ((low & 0x3) == 0x3) ? 4 : 2;
+}
+
+// 2410699 实现：中断处理
+void interrupt_handler(struct trapframe *tf) {
+    (void)tf;
+}
+
+// 2411570 实现：异常处理
+void exception_handler(struct trapframe *tf) {
+    switch (tf->cause) {
+        case CAUSE_ILLEGAL_INSTRUCTION:
+            cprintf("Illegal instruction at 0x%08x\n", tf->epc);
+            // epc 保存的是出错指令本身，需要越过它，否则 sret 后会再次触发同一个异常
+            tf->epc += insn_length(tf->epc);
+            break;
+        case CAUSE_BREAKPOINT:
+            cprintf("Breakpoint at 0x%08x\n", tf->epc);
+            // ebreak 可能被汇编成 2 字节的 c.ebreak，所以不能固定加 4
+            tf->epc += insn_length(tf->epc);
+            break;
+        default:
+            // 其他异常不处理，输出完整现场。不读取 epc 指向的内存，也不修改 epc
+            print_trapframe(tf);
+            break;
+    }
+}
 
 
 static inline void trap_dispatch(struct trapframe *tf) {
