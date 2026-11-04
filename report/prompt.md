@@ -161,3 +161,97 @@ void exception_handler(struct trapframe *tf);   // 必须具有外部链接，�
 - Case 3 中不得读取 tf->epc 所指的内存，因为测试会传入 epc 为 0 的手工 trapframe。
 - 输出的提示信息格式需保证评分脚本能匹配到 "Illegal instruction at" 和 "Breakpoint at"，Case 3 的输出需包含 print_trapframe 打印的 "cause    0x%08x" 一行。
 ````
+
+2410699 张欣妍
+
+````
+[PROMPT]
+**任务**：修改文件 kern/trap/trap.c，在标有 `//lab3 function2` 的位置实现中断处理函数 interrupt_handler：当 trap 的原因是中断而不是异常时，由它根据中断类型完成处理——时钟中断需要续设下一次时钟事件、累加 ticks、按周期输出统计信息并在达到规定次数后关闭系统；软件中断与未知中断只输出规定的提示信息。本任务只负责中断处理，不负责异常处理（exception_handler 已由其他成员实现）、不负责 trap_dispatch 的分发逻辑、不负责 trapentry.S 中现场的保存与恢复。
+
+**操作要求**：你必须在项目中修改实际文件，而不是仅展示代码。保留文件中的现有代码，不修改 trap.c 中 interrupt_handler 以外的任何函数（包括 print_ticks、print_trapframe、trap_dispatch、trap、idt_init、exception_handler、insn_length）。可以添加内部使用的宏和 static 辅助变量。需要为新用到的接口补充对应的 #include。
+
+**输出要求**：直接进行文件操作，使用下面 [RELY]、[GUARANTEE]、[SPECIFICATION] 中的信息，以工程真实代码为准，不要引入无关功能。
+
+[RELY]
+// 中断原因编号（libs/riscv.h）
+#define IRQ_S_SOFT   1   // S 态软件中断
+#define IRQ_S_TIMER  5   // S 态时钟中断
+
+// scause 位域事实（RISC-V 特权级规范）
+// scause 的最高位（bit63）为 1 表示中断，为 0 表示异常；低 63 位才是具体原因编码。
+// 因此真实时钟中断的取值是 0x8000000000000005，而不是 5。
+// trap_dispatch 用 (intptr_t)tf->cause < 0 判断“是中断”，但进入本函数后仍需自行剥离最高位。
+
+// 数据结构（kern/trap/trap.h），所有字段类型均为 uintptr_t
+struct trapframe {
+    struct pushregs gpr;   // 32 个通用寄存器
+    uintptr_t status;      // sstatus
+    uintptr_t epc;         // sepc
+    uintptr_t badvaddr;    // stval
+    uintptr_t cause;       // scause
+};
+
+// 可用接口
+void clock_set_next_event(void);        // kern/driver/clock.c：设定“当前时间 + timebase”后的下一个时钟事件
+extern volatile size_t ticks;           // kern/driver/clock.h：时钟中断计数
+static void print_ticks(void);          // kern/trap/trap.c 已实现：输出 “%d ticks”，TICK_NUM 为 100
+void sbi_shutdown(void);                // libs/sbi.h：关闭系统
+int cprintf(const char *fmt, ...);      // kern/libs/stdio.c：格式化输出
+#define TICK_NUM 100                    // kern/trap/trap.c 已定义
+
+// 时钟硬件事实
+// OpenSBI 的 sbi_set_timer 一次只能设定一个未来的触发时刻，不能设定“周期中断”，
+// 因此每收到一次时钟中断都必须重新设定下一次，否则只会收到一次中断。
+
+// 调用关系
+// trap_dispatch() 在 tf->cause 最高位为 1 时调用 interrupt_handler(tf)。
+// 本函数返回后，trapentry.S 用 tf 中的内容恢复现场并 sret，返回到 tf->epc 指向的指令。
+// 中断是异步事件，tf->epc 保存的是被打断的那条指令的地址。
+
+[GUARANTEE]
+必须实现的接口：
+```c
+void interrupt_handler(struct trapframe *tf);   // 必须具有外部链接，不能声明为 static
+```
+该函数必须定义在 trap_dispatch 之前，使 trap_dispatch 能正常调用。测试代码在其他源文件中通过 extern 引用它，所以不能改函数名、参数和返回值类型。
+
+必须新增的 include 与宏：
+- `#include <sbi.h>`：sbi_shutdown() 的声明来源，缺失会在 -Werror 下编译失败。
+- `#define SHUTDOWN_AFTER 10`：关机前打印 “100 ticks” 的次数上限，必须大于 2。
+
+不允许修改：
+- print_ticks()、print_trapframe()、trap_dispatch()、trap()、idt_init()、exception_handler()、insn_length()、SAVE_ALL、RESTORE_ALL、__alltraps、struct trapframe。
+- 不得改动 TICK_NUM 的值，不得改动 print_ticks 的输出格式。
+
+你可以根据需要添加：内部使用的宏、static 辅助变量（例如关机计数）与注释。
+
+[SPECIFICATION]
+## interrupt_handler
+**Pre-Condition**:
+- 由 trap_dispatch 在中断（cause 最高位为 1）时调用，tf 非空，指向 trapentry.S 保存好的有效 trapframe。
+- 也可能被测试代码用手工构造的 trapframe 直接调用，此时除 cause 外其它字段可能为 0，不可假设 epc 指向有效内存。
+
+**Post-Condition**:
+- 函数正常返回，不 panic、不死循环。
+- 不修改 tf 中的任何字段（尤其 tf->epc），保证 sret 返回后被中断的指令能继续执行。
+- 时钟中断处理后，下一个时钟事件已被重新设定，系统能够持续收到时钟中断。
+
+**Case 1**（cause 是 IRQ_S_TIMER，时钟中断）:
+- 调用 clock_set_next_event() 设定下一次时钟事件；
+- ticks 自增 1；
+- 当 ticks 是 TICK_NUM 的整数倍时调用 print_ticks()；
+- 累计 print_ticks() 调用次数达到 SHUTDOWN_AFTER 时调用 sbi_shutdown()。
+
+**Case 2**（cause 是 IRQ_S_SOFT，S 态软件中断）:
+- 输出一行 “Supervisor software interrupt”，不修改 tf。
+
+**Case 3**（其他任何中断原因）:
+- 输出一行 “Unknown interrupt: cause <cause 的十进制值>”，不修改 tf，不调用 print_trapframe。
+
+**Requirements**:
+- 分支判断必须使用剥离最高位后的原因编号，禁止直接 switch (tf->cause)。
+- 时钟中断必须先续设下一次事件再返回；漏掉续设会导致系统只收到一次时钟中断。
+- SHUTDOWN_AFTER 必须大于 2（取 10），且按 print_ticks 被调用的次数判定，不能与 ticks 本值直接比较。
+- 输出格式必须严格为 “Supervisor software interrupt” 与 “Unknown interrupt: cause %d”，评分脚本用固定字符串匹配，多一个字符都会失败。
+- 未知中断分支禁止调用 print_trapframe（它是异常处理的兜底手段，会打印 “cause    0x%08x” 格式，与规定输出不符）。
+````

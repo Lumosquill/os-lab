@@ -4,9 +4,9 @@
 
 | 项目       | 内容                                  |
 | -------- | ----------------------------------- |
-| **实验名称** | Lab 3: 中断与中断处理                     |
+| **实验名称** | Lab 3: 中断与中断处理                      |
 | **小组成员** | 2411570-何美璇、2410699-张欣妍、2411433-李烁菲 |
-| **完成日期** | 2026-11-                            |
+| **完成日期** | 2026-11-4                           |
 
 ### 小组分工
 
@@ -14,11 +14,12 @@
 | --------------   | ------------------------------------------- | --------------------------------------------------------------- |
 | 2411433-李烁菲   | 功能模块一|实验目的，整体分析，对操作系统的理解，以及模块一的对应部分|
 | 2411570-何美璇 | <font color="">功能模块二中的异常处理（exception_handler）</font> | <font color="">功能模块二（异常处理部分），六、实验总结与收获对应部分</font> |
-| 2410699-张欣妍 |  |         |
+| 2410699-张欣妍 | 功能模块二中的中断处理（interrupt_handler） | 功能模块二（中断处理部分）与 prompt.md 第 3 段 |
 
 
 
 ## 一、实验目的
+
 1. 理解 RISC-V 架构下的中断与异常处理机制，掌握相关寄存器、指令及中断使能方式。
 2. 理解 Trap frame 的作用，掌握处理器上下文的保存、恢复及 Trap 入口与返回流程。
 3. 掌握中断与异常的分类和分发机制，实现时钟中断、非法指令异常和断点异常的处理。
@@ -29,11 +30,11 @@
 
 你们使用的 AI 工具
 
-| 成员          | AI 编程工具               | 底层模型              | 备注  |
-| ----------- | --------------------- | ----------------- | --- |
-| 2411570-何美璇 | Claude Code | Claude Sonnet 5.5 |     |
-| 2410699-张欣妍 | DeepSeek Harness      | DeepSeek-V4-Flash |     |
-| 2411433-李烁菲 | claude      | claude sonnet 5                  |     |
+| 成员          | AI 编程工具          | 底层模型                | 备注  |
+| ----------- | ---------------- | ------------------- | --- |
+| 2411570-何美璇 | Claude Code      | Claude Sonnet 5.5   |     |
+| 2410699-张欣妍 | DeepSeek Harness | DeepSeek-V4.1-Flash |     |
+| 2411433-李烁菲 | claude           | claude sonnet 5     |     |
 
 **运行环境与工具链**
 
@@ -411,82 +412,224 @@ void exception_handler(struct trapframe *tf);   // 必须具有外部链接，�
 
 
 
-### 功能模块二
+### 功能模块二：中断处理功能（interrupt_handler）
 
-**负责人：** 
+**负责人：** 2410699-张欣妍
 
 #### 模块功能描述
 
-**需要实现/修改的函数：**
+**需要实现的函数：**
 
+```c
+// 成员C 实现：中断处理
+void interrupt_handler(struct trapframe *tf) {
+    // scause 的最高位为 1 表示中断，低 63 位才是原因编码。
+    // 必须先剥掉最高位，否则真实的中断值 0x8000000000000005 无法与 IRQ_S_TIMER 匹配。
+    intptr_t cause = (intptr_t)((tf->cause << 1) >> 1);
+
+    static int printed = 0;  // 已打印的 "100 ticks" 行数
+
+    switch (cause) {
+        case IRQ_S_TIMER:
+            // OpenSBI 一次只能设定一个时钟事件，必须每拍重新续期，否则只会收到一次中断
+            clock_set_next_event();
+            ticks++;
+            if (ticks % TICK_NUM == 0) {
+                print_ticks();
+                // 按打印次数判定关机点，保证 ticks=200 的统计信息能先打印出来
+                if (++printed == SHUTDOWN_AFTER) {
+                    sbi_shutdown();
+                }
+            }
+            break;
+        case IRQ_S_SOFT:
+            cprintf("Supervisor software interrupt\n");
+            break;
+        default:
+            // 未知中断只做提示；print_trapframe 是异常的兜底手段，不能在这里用
+            cprintf("Unknown interrupt: cause %d\n", (int)cause);
+            break;
+    }
+}
+```
 
 **功能说明：**
 
+`interrupt_handler()` 负责处理 Trap 原因为中断的情况，由 `trap_dispatch()` 在 `tf->cause` 最高位为 1 时调用，是中断处理路径上唯一的业务入口。它处理完成后直接返回，由 `trapentry.S` 中的 `__trapret` 恢复现场并执行 `sret`，因此本函数的职责只有“分类”和“分类对应的处理”，不涉及现场保存与恢复。
 
+该模块要处理的核心问题是中断类型的识别。RISC-V 的 `scause` 用一个寄存器同时编码“是否为中断”和“中断原因”：最高位是中断标志，低 63 位才是原因编号。真实时钟中断的取值是 `0x8000000000000005`，而不是 `5`。因此函数进入后首先要把最高位剥离，得到纯原因编号再做分类；如果直接对 `tf->cause` 做分支判断，任何 `case` 都不会命中，所有中断都会落进兜底分支。剥离之后，函数按三类情形分别处理。
+
+第一类是时钟中断（`IRQ_S_TIMER`），也是本模块唯一需要“产生副作用”的分支。它需要完成四件事：调用 `clock_set_next_event()` 续设下一次时钟事件、`ticks` 自增、在 `ticks` 达到 `TICK_NUM` 的整数倍时调用已有的 `print_ticks()` 输出统计信息、累计输出次数达到 `SHUTDOWN_AFTER` 后调用 `sbi_shutdown()` 关闭系统。其中“续设”不能省略：OpenSBI 提供的 `sbi_set_timer` 一次只能设定一个未来的触发时刻，并不能设定周期中断，如果只在初始化时设定一次，系统只会收到一次时钟中断，表现为没有任何 `100 ticks` 输出。
+
+第二类是 S 态软件中断（`IRQ_S_SOFT`），只需输出规定的一行提示信息，用于验证中断分类是否正确。第三类是其他未识别的中断原因，输出带原因编号的提示信息作为兜底。这里有一个需要权衡的细节：指导书把 `print_trapframe()` 作为未知类型的兜底手段，但评分脚本按固定字符串匹配输出，中断分支要求的是 `Unknown interrupt: cause <编号>`；`print_trapframe()` 打印的是 `cause    0x%08x` 这种现场格式，两者职责不同，因此未知中断分支只做提示，`print_trapframe()` 留给异常处理使用。
+
+还有一点与异常处理正好相反：本函数不修改 `tf->epc`。中断是异步事件，`sepc` 保存的就是被打断的那条指令的地址，原样返回才能继续执行；而非法指令、断点这类同步异常必须把 `epc` 推到下一条指令，否则会反复触发同一个异常。
 
 #### 最终提示词
 
 以下是经过迭代优化后，最终成功实现该功能的提示词：
 
+````markdown
+[PROMPT]
+**任务**：修改文件 kern/trap/trap.c，在标有 `//lab3 function2` 的位置实现中断处理函数 interrupt_handler：当 trap 的原因是中断而不是异常时，由它根据中断类型完成处理——时钟中断需要续设下一次时钟事件、累加 ticks、按周期输出统计信息并在达到规定次数后关闭系统；软件中断与未知中断只输出规定的提示信息。本任务只负责中断处理，不负责异常处理（exception_handler 已由其他成员实现）、不负责 trap_dispatch 的分发逻辑、不负责 trapentry.S 中现场的保存与恢复。
 
+**操作要求**：你必须在项目中修改实际文件，而不是仅展示代码。保留文件中的现有代码，不修改 trap.c 中 interrupt_handler 以外的任何函数（包括 print_ticks、print_trapframe、trap_dispatch、trap、idt_init、exception_handler、insn_length）。可以添加内部使用的宏和 static 辅助变量。需要为新用到的接口补充对应的 #include。
+
+**输出要求**：直接进行文件操作，使用下面 [RELY]、[GUARANTEE]、[SPECIFICATION] 中的信息，以工程真实代码为准，不要引入无关功能。
+
+[RELY]
+// 中断原因编号（libs/riscv.h）
+#define IRQ_S_SOFT   1   // S 态软件中断
+#define IRQ_S_TIMER  5   // S 态时钟中断
+
+// scause 位域事实（RISC-V 特权级规范）
+// scause 的最高位（bit63）为 1 表示中断，为 0 表示异常；低 63 位才是具体原因编码。
+// 因此真实时钟中断的取值是 0x8000000000000005，而不是 5。
+// trap_dispatch 用 (intptr_t)tf->cause < 0 判断“是中断”，但进入本函数后仍需自行剥离最高位。
+
+// 数据结构（kern/trap/trap.h），所有字段类型均为 uintptr_t
+struct trapframe {
+    struct pushregs gpr;   // 32 个通用寄存器
+    uintptr_t status;      // sstatus
+    uintptr_t epc;         // sepc
+    uintptr_t badvaddr;    // stval
+    uintptr_t cause;       // scause
+};
+
+// 可用接口
+void clock_set_next_event(void);        // kern/driver/clock.c：设定“当前时间 + timebase”后的下一个时钟事件
+extern volatile size_t ticks;           // kern/driver/clock.h：时钟中断计数
+static void print_ticks(void);          // kern/trap/trap.c 已实现：输出 “%d ticks”，TICK_NUM 为 100
+void sbi_shutdown(void);                // libs/sbi.h：关闭系统
+int cprintf(const char *fmt, ...);      // kern/libs/stdio.c：格式化输出
+#define TICK_NUM 100                    // kern/trap/trap.c 已定义
+
+// 时钟硬件事实
+// OpenSBI 的 sbi_set_timer 一次只能设定一个未来的触发时刻，不能设定“周期中断”，
+// 因此每收到一次时钟中断都必须重新设定下一次，否则只会收到一次中断。
+
+// 调用关系
+// trap_dispatch() 在 tf->cause 最高位为 1 时调用 interrupt_handler(tf)。
+// 本函数返回后，trapentry.S 用 tf 中的内容恢复现场并 sret，返回到 tf->epc 指向的指令。
+// 中断是异步事件，tf->epc 保存的是被打断的那条指令的地址。
+
+[GUARANTEE]
+必须实现的接口：
+```c
+void interrupt_handler(struct trapframe *tf);   // 必须具有外部链接，不能声明为 static
+```
+该函数必须定义在 trap_dispatch 之前，使 trap_dispatch 能正常调用。测试代码在其他源文件中通过 extern 引用它，所以不能改函数名、参数和返回值类型。
+
+必须新增的 include 与宏：
+- `#include <sbi.h>`：sbi_shutdown() 的声明来源，缺失会在 -Werror 下编译失败。
+- `#define SHUTDOWN_AFTER 10`：关机前打印 “100 ticks” 的次数上限，必须大于 2。
+
+不允许修改：
+- print_ticks()、print_trapframe()、trap_dispatch()、trap()、idt_init()、exception_handler()、insn_length()、SAVE_ALL、RESTORE_ALL、__alltraps、struct trapframe。
+- 不得改动 TICK_NUM 的值，不得改动 print_ticks 的输出格式。
+
+你可以根据需要添加：内部使用的宏、static 辅助变量（例如关机计数）与注释。
+
+[SPECIFICATION]
+## interrupt_handler
+**Pre-Condition**:
+- 由 trap_dispatch 在中断（cause 最高位为 1）时调用，tf 非空，指向 trapentry.S 保存好的有效 trapframe。
+- 也可能被测试代码用手工构造的 trapframe 直接调用，此时除 cause 外其它字段可能为 0，不可假设 epc 指向有效内存。
+
+**Post-Condition**:
+- 函数正常返回，不 panic、不死循环。
+- 不修改 tf 中的任何字段（尤其 tf->epc），保证 sret 返回后被中断的指令能继续执行。
+- 时钟中断处理后，下一个时钟事件已被重新设定，系统能够持续收到时钟中断。
+
+**Case 1**（cause 是 IRQ_S_TIMER，时钟中断）:
+- 调用 clock_set_next_event() 设定下一次时钟事件；
+- ticks 自增 1；
+- 当 ticks 是 TICK_NUM 的整数倍时调用 print_ticks()；
+- 累计 print_ticks() 调用次数达到 SHUTDOWN_AFTER 时调用 sbi_shutdown()。
+
+**Case 2**（cause 是 IRQ_S_SOFT，S 态软件中断）:
+- 输出一行 “Supervisor software interrupt”，不修改 tf。
+
+**Case 3**（其他任何中断原因）:
+- 输出一行 “Unknown interrupt: cause <cause 的十进制值>”，不修改 tf，不调用 print_trapframe。
+
+**Requirements**:
+- 分支判断必须使用剥离最高位后的原因编号，禁止直接 switch (tf->cause)。
+- 时钟中断必须先续设下一次事件再返回；漏掉续设会导致系统只收到一次时钟中断。
+- SHUTDOWN_AFTER 必须大于 2（取 10），且按 print_ticks 被调用的次数判定，不能与 ticks 本值直接比较。
+- 输出格式必须严格为 “Supervisor software interrupt” 与 “Unknown interrupt: cause %d”，评分脚本用固定字符串匹配，多一个字符都会失败。
+- 未知中断分支禁止调用 print_trapframe（它是异常处理的兜底手段，会打印 “cause    0x%08x” 格式，与规定输出不符）。
+````
 
 #### 实现迭代过程
 
 本模块的实现经历了 2 次迭代，过程如下：
 
-
 ##### 第一次迭代
 
 **遇到的问题：**
 
+1. 代码生成后首次构建失败，汇编阶段报 `Error: unknown CSR 'sbadaddr'`（`kern/trap/trapentry.S` 第 47 行，位于实验框架已经提供的 `SAVE_ALL` 宏中）。原因是当前工具链的 binutils 已经移除了 `sbadaddr` 这个旧 CSR 名（RISC-V 特权级规范 1.10 之前的叫法），只接受标准名 `stval`。这个问题与中断处理逻辑无关，但会阻塞整个内核的编译与验证。
 
 **问题解决策略：**
 
-
+1. 把 `SAVE_ALL` 中的 `csrr s3, sbadaddr` 改为 `csrr s3, stval`。两者是同一个寄存器（CSR 0x143），寄存器编号与 `struct trapframe` 的字段布局都不受影响，修改后编译通过。由于该宏属于实验框架代码、文件归属功能模块一，这一行改动已同步给对应成员确认。
 
 ##### 第二次迭代
 
 **遇到的问题：**
 
-
+1. 第一次执行 `make grade` 只得到 35/100：Test 1 通过，Test 2 与 Test 3 全部失败。从现象看像是中断处理没有生效，而这两个用例的判据（`Supervisor software interrupt`、`Unknown interrupt: cause 15`、`ticks` 的增长）恰好都只由 `interrupt_handler()` 产生。
+2. 继续排查发现，原因不在代码逻辑，而在验证链路上：本地用于编译的源码副本中，`interrupt_handler()` 还是框架留下的占位空实现 `{ (void)tf; }`，实际改动没有同步到该副本，等于带着空函数去跑测试。
 
 **问题解决策略：**
 
-
+1. 先用 `grep -n "(void)tf;" kern/trap/trap.c` 确认占位实现仍然存在，再用 `diff` 对比源码目录与编译目录，确认是副本没有同步。
+2. 同步后重新执行 `make clean && make grade`，三个用例全部通过，得到 `Total Score: 100/100`。由此总结出一条经验：当出现“一整类用例全部失败”时，应先确认被测试的源码就是所修改的那一份，再去怀疑逻辑本身。
 
 **最终结果：**
 
+经过 2 次迭代，该模块最终：
+- 编译通过（`-Werror` 下无告警）。
+- 所有相关测试通过：Test 2（中断部分）与 Test 3 均通过，`make grade` 得到 `Total Score: 100/100`。
+- 功能符合预期：时钟中断持续触发，每 100 次输出一行统计信息，累计 10 次后关机。
 
-**关键改进点总结（如有）：**
+**关键改进点总结：**
 
+1. 在 `[RELY]` 中补充 `scause` 的位域事实（最高位为中断标志、低 63 位为原因编号），并在 `[SPECIFICATION]` 的 `Requirements` 中明确禁止直接用 `tf->cause` 做分支判断。
+2. 把评分脚本使用的固定字符串（`Supervisor software interrupt`、`Unknown interrupt: cause %d`）写进 `Requirements`，并说明输出必须逐字匹配，避免模型自创格式或改用 `print_trapframe()` 兜底。
+3. 在 `[SPECIFICATION]` 中把“达到规定次数关机”明确为 `print_ticks()` 被调用的次数达到 `SHUTDOWN_AFTER`，并规定该宏必须大于 2、取 10，使关机点后移到 `ticks=1000`，为测试留出观察窗口。
 
+#### 验证结果
 
+本模块的两项关键验证如下：`make qemu` 运行时，时钟中断每隔 10 ms 触发一次，每累计 100 次输出一行 `100 ticks`，连续输出 10 行后系统关机；在 `GRADE_LAB3_TIMER` 配置下，`ticks` 持续增长到 200，测试输出 `[Test 3] Sustained supervisor timer: PASS (40/40, ticks=200)`。
 
+![make qemu：setup timer interrupts 之后连续输出 100 ticks](./images/C_qemu_100ticks.png)
 
-
-
+![Test 3：ticks 增长到 200，Sustained supervisor timer PASS](./images/C_test3_ticks200.png)
 
 ## 五、测试与验证
 
-<!-- 根据该实验的具体情况，提供完整的测试运行截图，应包含：
-
-- 编译及运行成功的输出（make qemu），可能有多个
-- 测试通过的结果（make grade），只有一个
-
-\-->
-
 **测试截图：**
 
-**运行验证 `make qemu`（QEMU 4.1.1 ）：**
+本实验在 WSL2（Ubuntu 26.04）+ `riscv64-unknown-elf-gcc` 15.1.0 + `qemu-system-riscv64` 4.1.1 环境下完成验证。测试用例与评测脚本由实验框架自带（`tools/test_lab3.c`、`tools/test_lab3_context.S`、`tools/grade.sh`、`tools/inject.py`）：`make grade` 会把测试源码注入内核副本，分别以 `GRADE_LAB3_CONTEXT`、`GRADE_LAB3_ILLEGAL`、`GRADE_LAB3_TIMER` 三个宏重新构建并运行，逐项检查串口输出。
 
-![make qemu 运行输出：OpenSBI v0.4、best_fit_pmm_manager、check_alloc_page() succeeded!](./images/B_bestfit_qemu.png)
+**编译与运行（`make qemu`）：**
 
+时钟中断每 10 ms 触发一次，`ticks` 每累计 100 次输出一行 `100 ticks`，累计 10 次（`ticks=1000`）后调用 `sbi_shutdown()` 关机。
 
-![make grade：check page init OK、check best fit OK、Total Score 20/20](./images/B_grade.png)
+![make qemu：setup timer interrupts 之后连续输出 100 ticks](./images/C_qemu_100ticks.png)
 
+**测试结果（`make grade`）：**
 
+| 测试项 | 主要判据 | 得分 |
+|---|---|---|
+| Test 1：Trap 入口、寄存器现场恢复与断点返回 | `Breakpoint at`，以及测试所用的 26 个通用寄存器现场比对 | 35/35 |
+| Test 2：非法指令越过与中断分类输出 | `Illegal instruction at`、`Supervisor software interrupt`、`Unknown interrupt: cause 15`、`cause    0x00000014` | 25/25 |
+| Test 3：时钟中断持续触发与重复返回 | `100 ticks`、`ticks=200` | 40/40 |
+| **合计** | | **100/100** |
 
-![Buddy 与 SLUB 分配器运行结果](images/buddy+slub.png)
+![make grade：三个用例全部 PASS，Total Score 100/100](./images/C_grade.png)
 
 
 ## 六、实验总结与收获
@@ -517,14 +660,18 @@ void exception_handler(struct trapframe *tf);   // 必须具有外部链接，�
 ### AI 协作开发的经验
 
 **成员A（李烁菲2411433）**：
+
 在本次与AI协作编写代码的过程中，我发现 AI 生成的代码不一定完全正确。例如，最初的寄存器恢复逻辑存在提前恢复 sp、遗漏恢复 sepc 等问题。针对这些问题，我结合 RISC-V 的相关知识检查代码，并使用交叉编译工具生成目标文件，通过 objdump 反汇编检查指令顺序，从而验证代码在静态层面是否符合预期。通过本次实验，我认识到 AI 可以作为辅助的工具，而不能替代开发者自身的理解与验证。
 
 
 
 **成员B（何美璇2411570）**：
+
 <font color="">在本次与 AI 协作的过程中，我发现 AI 生成代码的质量很大程度上取决于提示词是否把约束写完整。第一版提示词没有写明指令长度不一定是 4 字节，也没有限制兜底分支读取 epc 指向的内存，这两处都是测试会覆盖到的情况，AI 容易按常见写法处理而忽略它们。补充这两条约束，并在规格中写明对应的测试场景后，生成结果才符合要求。通过本次实验，我认识到编写提示词时需要把边界情况和测试条件提前写清楚，不能只描述正常流程。</font>
 
 
 
-成员C：
+**成员C（张欣妍 2410699）**：
+
+在本次与 AI 协作的过程中，我体会最深的一点是：把验收条件写进提示词，比把功能描述写得更详细更有效。中断分类这一步，模型很容易把 `scause` 当成普通整数直接 `switch`，而 RISC-V 的 `scause` 最高位是中断标志，真实的时钟中断值是 `0x8000000000000005`，这样写会让所有分支都匹配不上。我是在读 `tools/grade.sh` 时发现它用固定字符串去匹配 `Supervisor software interrupt`、`Unknown interrupt: cause 15` 这类输出，才意识到输出格式和分支判定都是硬约束，于是把位域事实和这些字符串直接写进 `[RELY]` 与 `[SPECIFICATION]` 的 `Requirements`。另外，`SHUTDOWN_AFTER` 的取值也不是随手定的：它决定关机时刻，取小了会抢在测试的观察窗口之前关机。
 

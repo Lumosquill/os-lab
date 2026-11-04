@@ -6,10 +6,13 @@
 #include <memlayout.h>
 #include <mmu.h>
 #include <riscv.h>
+#include <sbi.h>
 #include <stdio.h>
 #include <trap.h>
 
 #define TICK_NUM 100
+/* 成员C：关机前打印 "100 ticks" 的次数上限（必须 > 2；取 10 使关机点落在 ticks=1000） */
+#define SHUTDOWN_AFTER 10
 
 static void print_ticks() {
     cprintf("%d ticks\n", TICK_NUM);
@@ -88,9 +91,35 @@ static size_t insn_length(uintptr_t addr) {
     return ((low & 0x3) == 0x3) ? 4 : 2;
 }
 
-// 2410699 实现：中断处理
+// 成员C 实现：中断处理
 void interrupt_handler(struct trapframe *tf) {
-    (void)tf;
+    // scause 的最高位为 1 表示中断，低 63 位才是原因编码。
+    // 必须先剥掉最高位，否则真实的中断值 0x8000000000000005 无法与 IRQ_S_TIMER 匹配。
+    intptr_t cause = (intptr_t)((tf->cause << 1) >> 1);
+
+    static int printed = 0;  // 已打印的 "100 ticks" 行数
+
+    switch (cause) {
+        case IRQ_S_TIMER:
+            // OpenSBI 一次只能设定一个时钟事件，必须每拍重新续期，否则只会收到一次中断
+            clock_set_next_event();
+            ticks++;
+            if (ticks % TICK_NUM == 0) {
+                print_ticks();
+                // 按"打印次数"判定关机点，保证 ticks=200 的统计信息能先打印出来
+                if (++printed == SHUTDOWN_AFTER) {
+                    sbi_shutdown();
+                }
+            }
+            break;
+        case IRQ_S_SOFT:
+            cprintf("Supervisor software interrupt\n");
+            break;
+        default:
+            // 未知中断只做提示；print_trapframe 是异常的兜底手段，不能在这里用
+            cprintf("Unknown interrupt: cause %d\n", (int)cause);
+            break;
+    }
 }
 
 // 2411570 实现：异常处理
