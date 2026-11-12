@@ -289,7 +289,59 @@ struct Page *get_page(pde_t *pgdir, uintptr_t la, pte_t **ptep_store)
     return NULL;
 }
 
-//LAB4 function1 YOUR CODE
+
+
+
+//LAB4 2411433
+
+// page_remove_pte - 撤销一个已知的页表项（ptep 必须由 get_pte 得到）
+static inline void page_remove_pte(pde_t *pgdir, uintptr_t la, pte_t *ptep)
+{
+    if (*ptep & PTE_V)
+    {
+        struct Page *page = pte2page(*ptep);
+        if (page_ref_dec(page) == 0)
+        {
+            free_page(page);
+        }
+        *ptep = 0;
+        tlb_invalidate(pgdir, la);
+    }
+}
+
+int page_insert(pde_t *pgdir, struct Page *page, uintptr_t la, uint32_t perm)
+{
+    pte_t *ptep = get_pte(pgdir, la, 1);
+    if (ptep == NULL)
+    {
+        return -E_NO_MEM;
+    }
+    page_ref_inc(page);              // 先加引用，防止旧映射就是同一页时被误释放
+    if (*ptep & PTE_V)
+    {
+        struct Page *old = pte2page(*ptep);
+        if (old == page)
+        {
+            page_ref_dec(page);      // 同一物理页：只更新权限，抵消多加的引用
+        }
+        else
+        {
+            page_remove_pte(pgdir, la, ptep);   // 别的物理页：先撤销旧映射
+        }
+    }
+    *ptep = pte_create(page2ppn(page), PTE_V | perm);
+    tlb_invalidate(pgdir, la);
+    return 0;
+}
+
+void page_remove(pde_t *pgdir, uintptr_t la)
+{
+    pte_t *ptep = get_pte(pgdir, la, 0);   // create=0，删除时不分配页表页
+    if (ptep != NULL)
+    {
+        page_remove_pte(pgdir, la, ptep);
+    }
+}
 
 
 
