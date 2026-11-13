@@ -221,4 +221,45 @@ init_main(void *arg)
 //LAB4 function2 YOUR CODE
 
 
-//LAB4 function3 YOUR CODE
+//LAB4 function3 2410699
+// 成员C：proc_run / cpu_idle
+
+void proc_run(struct proc_struct *proc)
+{
+    if (proc != current)
+    {
+        bool intr_flag;
+        struct proc_struct *prev = current, *next = proc;
+
+        // 关中断：保证 current、satp、上下文三者切换的原子性
+        local_intr_save(intr_flag);
+        {
+            // 先更新 current，再切换页表和上下文；三步都在临界区内
+            current = proc;
+
+            // Sv39 的 satp：MODE=8 位于最高 4 位，PPN 是根页表物理页号（pgdir >> 12）。
+            write_csr(satp, 0x8000000000000000 | (next->pgdir >> RISCV_PGSHIFT));
+
+            // 写 satp 不会自动失效 TLB，必须显式 sfence.vma（flush_tlb 内部就是它）
+            flush_tlb();
+
+            // 保存 prev 的 ra/sp/s0~s11 到 prev->context，恢复 next 的 ra/sp/s0~s11；ret 后：老线程回到本次调用的下一条指令；第一次运行的新线程跳到 next->context.ra = forkret。
+            switch_to(&(prev->context), &(next->context));
+        }
+        // 被切走的线程恢复运行时，会从这里继续，恢复它自己的中断状态
+        local_intr_restore(intr_flag);
+    }
+}
+
+// cpu_idle：
+void cpu_idle(void)
+{
+    while (1)
+    {
+        if (current->need_resched)
+        {
+            // 进入 schedule 后可能切到别的线程；等再次回到 idleproc 时，会从 schedule 返回处继续，再次检查 need_resched。
+            schedule();
+        }
+    }
+}

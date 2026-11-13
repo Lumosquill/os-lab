@@ -101,5 +101,78 @@ Requirements:
 ```
 
 
+---
 
+2410699 张欣妍
 
+```
+[PROMPT]
+任务：只修改 kern/process/switch.S、kern/schedule/sched.c、kern/process/proc.c 中
+“//LAB4 function3”标记处，实现 Lab4 功能模块三“进程调度”：switch_to、proc_run、
+cpu_idle、schedule。保留所有已有代码和其他标记，不要修改 kern/mm/pmm.c、proc.c 的
+function2、proc.h、sched.h、sync.h、trap/*、init.c。
+
+[RELY]
+1. struct context（kern/process/proc.h）按顺序为：
+   uintptr_t ra, sp, s0, s1, ..., s11; 每个 8 字节，偏移 0,8,16,...,112。
+2. 声明：
+   void switch_to(struct context *from, struct context *to);  // 参数在 a0/a1
+   void proc_run(struct proc_struct *proc);
+   void schedule(void);
+   void cpu_idle(void) __attribute__((noreturn));
+3. 全局量：current、idleproc、proc_list 已在 proc.c 定义并在 proc.h 声明。
+4. struct proc_struct 字段：state、pid、runs、kstack、need_resched、parent、mm、
+   context、tf、pgdir、flags、name、list_link、hash_link。
+5. 状态：PROC_RUNNABLE；le2proc(le, list_link)；list_next()；
+   local_intr_save/local_intr_restore（sync.h）。
+6. riscv.h：SATP_MODE_SV39=8、RISCV_PGSHIFT=12、write_csr/read_csr；
+   pmm.h：flush_tlb()；pmm.c 的 enable_paging() 是 Sv39 satp 写法参照：
+   write_csr(satp, 0x8000000000000000 | (boot_pgdir_pa >> RISCV_PGSHIFT))。
+7. next->pgdir 是页表根节点的物理地址（不是虚拟地址）。
+
+[GUARANTEE]
+1. switch_to：保存 from 的 ra/sp/s0..s11 到 from->context 对应偏移；
+   加载 to 的 ra/sp/s0..s11；最后 ret 返回到 to->context.ra。
+   只保存 callee-saved，不保存 a0/a1/t0..t6。
+2. proc_run：proc == current 时直接返回；否则关中断，current = proc，
+   写 satp 为 Sv39 + (proc->pgdir >> 12)，flush_tlb()，
+   switch_to(&prev->context, &next->context)，最后恢复中断。
+3. cpu_idle：while (1) { if (current->need_resched) schedule(); }，不得返回。
+4. schedule：关中断；current->need_resched = 0；
+   current == idleproc 时从 proc_list 头开始，否则从 current->list_link 之后开始；
+   找第一个 PROC_RUNNABLE；找不到则 next = idleproc；next->runs++；
+   next != current 时 proc_run(next)；最后恢复中断。
+5. 所有对 current/proc_list/need_resched 的修改都在 local_intr_save/restore 临界区内。
+6. 不使用 lsatp()（Sv32）；不把 pgdir 当虚拟地址；不重复右移 12 位；
+   写 satp 后必须刷 TLB。
+
+[SPECIFICATION]
+## switch_to
+Pre: from、to 指向有效 context；from 是当前线程，to 是目标线程。
+Post: from 的 ra/sp/s0..s11 已保存；CPU 寄存器已恢复为 to 的值；
+      执行流返回到 to->context.ra；不修改内存中的其他字段。
+
+## proc_run
+Pre: proc 是有效 PCB；可能在中断开启或关闭的上下文调用。
+Post: proc == current 时无副作用返回；否则 current == proc，
+      satp 指向 proc->pgdir（Sv39），TLB 已刷新，
+      当前 CPU 上下文已切换到 proc；返回时“当前线程”是 proc。
+
+## cpu_idle
+Pre: current == idleproc，proc_init 已把 idleproc->need_resched 置 1。
+Post: 永不返回；每次 need_resched 为真时调用 schedule()。
+
+## schedule
+Pre: current 有效；proc_list 可能为空；调用者可能持有或不持有中断。
+Post: 选中一个 PROC_RUNNABLE 线程；若没有则选 idleproc；
+      current->need_resched 清零；next->runs 加一；
+      next != current 时完成一次 proc_run；返回时中断状态恢复到进入前。
+Cases:
+  Case 1: current != idleproc，从 current 之后轮转，回到 current 停止。
+  Case 2: current == idleproc，从 proc_list 头开始。
+  Case 3: 没有 RUNNABLE，next = idleproc 保底。
+  Case 4: next == current，不调用 proc_run，只增加 runs。
+  Case 5: proc_list 为空，仍能安全返回/切到 idleproc。
+验收：make 编译通过；make qemu 打印 initproc 三行；
+      make grade 的 [Test Schedule] PASS，总分 30/30。
+```

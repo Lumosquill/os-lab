@@ -10,13 +10,11 @@
 
 ### 小组分工
 
-| 成员          | 负责的练习/模块                                    | 负责的实验报告模块                                                       |
-| --------------   | ------------------------------------------- | --------------------------------------------------------------- |
-| 2411433-李烁菲   | 功能模块一+challenge2 | 实验目的，逻辑主线，模块一和challenge2相关部分 |
-| 2411570-何美璇 |  |  |
-| 2410699-张欣妍 |  |  |
-
-
+| 成员          | 负责的练习/模块         | 负责的实验报告模块                    |
+| ----------- | ---------------- | ---------------------------- |
+| 2411433-李烁菲 | 功能模块一+challenge2 | 实验目的，逻辑主线，模块一和challenge2相关部分 |
+| 2411570-何美璇 |                  |                              |
+| 2410699-张欣妍 | 功能模块三+challenge1 | 模块三、challenge1、调度测试与总结       |
 
 ## 一、实验目的
 
@@ -48,7 +46,6 @@
 | 构建工具 | GNU Make 4.4.1 |
 
 
-
 ## 三、实验整体逻辑分析
 
 ### 3.1 本章节的逻辑主线
@@ -68,14 +65,21 @@
 3. **进程调度（线程如何运行）。**
    `cpu_idle` 在空闲时检测重调度标志并调用 `schedule` 选出下一个可运行线程，`proc_run` 切换 `current` 和页表，`switch_to` 完成寄存器上下文的保存与恢复。新线程第一次运行时，沿着 `forkret → forkrets → __trapret` 的链路进入 `kernel_thread_entry`，最终执行 `initproc` 的入口函数。
 
-
 ### 3.2 功能的逐步实现
 
+本实验的功能不是一次性写完的，而是沿着“地址空间准备 → 线程对象创建 → 调度执行”的顺序逐步推进。这个顺序不是随便定的：没有可靠的页表映射，线程的内核栈和页表就没有落脚点；没有 PCB、内核栈和上下文，调度器就没有可切换的对象；没有调度器，创建出来的线程也只是挂在链表上的结构体，无法真正占用 CPU。具体可以分成三步：
 
+1. 首先实现虚拟内存页操作（功能模块一）。`page_insert` 负责把物理页挂到指定线性地址上，`page_remove` 负责撤销映射；两者一起保证页表项、物理页引用计数和 TLB 三者一致。`pmm_init` 里的 `check_pgdir`、`check_boot_pgdir` 以及 `test_lab4_pmm_basic` 会检查“映射是否建立、同一页多次映射时引用计数是否正确、删除后旧页表项是否清干净”。这一步完成后，内核才有一套可靠的“增删映射”接口，后面的线程内核栈、页表根节点才有基础。
 
+2. 接着实现进程创建与初始化（功能模块二）。`alloc_proc` 先得到一个干净的 PCB；`proc_init` 把当前执行现场包装成 `idleproc`，再通过 `kernel_thread(init_main, ...)` 创建第一个真正的内核线程 `initproc`；`kernel_thread` 构造临时 trapframe，`do_fork` 负责分配内核栈、PID、挂链表、唤醒，`copy_thread` 把 trapframe 和 context 放到新线程自己的内核栈上，并设置 `context.ra = forkret`、`context.sp = proc->tf`、`tf.gpr.s0 = fn`、`tf.gpr.s1 = arg`、`tf.epc = kernel_thread_entry`、`tf.status` 的 SPP/SPIE 位。这一步完成后，系统里至少有两个关键线程：`idleproc` 和 `initproc`，但 `initproc` 还没有真正运行。
 
+3. 最后实现进程调度（功能模块三）。`cpu_idle` 是 idleproc 的执行主体，它发现 `current->need_resched` 为真时调用 `schedule`；`schedule` 在关中断的临界区里从 `proc_list` 中选下一个 `PROC_RUNNABLE` 线程，找不到就退回 `idleproc`；`proc_run` 更新 `current`、把 `satp` 切换到新线程的页表根节点并刷新 TLB，最后 `switch_to` 保存旧线程的 `ra/sp/s0~s11`、恢复新线程的同一组寄存器。新线程第一次运行时，`switch_to` 的 `ret` 会跳到 `context.ra = forkret`，再沿 `forkret → forkrets → __trapret → kernel_thread_entry` 进入 `init_main`。这一步完成后，`initproc` 才真正从 `idleproc` 手里接管 CPU，系统从“有线程对象”变成“线程能轮流执行”。
 
+三条线的联调顺序也对应这个依赖关系：A 先交付出能通过 PMM 测试的版本，因为 `pmm_init` 里的检查会调用 `page_insert`，A 没完成之前 B/C 在 QEMU 里都跑不起来；然后 B 先验证 `[Test Process Create]`，确认 `idleproc`/`initproc` 的字段和首次运行上下文正确；最后由 B 和 C 一起验证 `[Test Schedule]`，确认 `schedule → proc_run → switch_to` 能让测试线程轮流运行。整个启动链可以概括为：
 
+`kern_init → pmm_init → pic_init/idt_init → vmm_init → proc_init → cpu_idle → schedule → proc_run → switch_to`
+
+其中前半段负责把地址空间和线程对象准备好，后半段负责让第一个可运行线程真正跑起来。
 
 ## 四、实验内容与实现
 
@@ -344,23 +348,161 @@ Requirements:
 
 
 
-### 功能模块三：
+### 功能模块三：进程调度
 
-**负责人：** 
+**负责人**：2410699-张欣妍
 
 #### 模块功能描述
 
 **需要实现的函数：**
 
+1. `switch_to`（`kern/process/switch.S`）
+
+```asm
+#include <riscv.h>
+
+    .text
+    .globl switch_to
+    .align 2
+switch_to:
+    # a0 = from, a1 = to
+    # 只保存 callee-saved：ra、sp、s0~s11
+    STORE ra,   0*REGBYTES(a0)
+    STORE sp,   1*REGBYTES(a0)
+    STORE s0,   2*REGBYTES(a0)
+    STORE s1,   3*REGBYTES(a0)
+    STORE s2,   4*REGBYTES(a0)
+    STORE s3,   5*REGBYTES(a0)
+    STORE s4,   6*REGBYTES(a0)
+    STORE s5,   7*REGBYTES(a0)
+    STORE s6,   8*REGBYTES(a0)
+    STORE s7,   9*REGBYTES(a0)
+    STORE s8,  10*REGBYTES(a0)
+    STORE s9,  11*REGBYTES(a0)
+    STORE s10, 12*REGBYTES(a0)
+    STORE s11, 13*REGBYTES(a0)
+
+    # 恢复 to 的 ra、sp、s0~s11
+    LOAD ra,   0*REGBYTES(a1)
+    LOAD sp,   1*REGBYTES(a1)
+    LOAD s0,   2*REGBYTES(a1)
+    LOAD s1,   3*REGBYTES(a1)
+    LOAD s2,   4*REGBYTES(a1)
+    LOAD s3,   5*REGBYTES(a1)
+    LOAD s4,   6*REGBYTES(a1)
+    LOAD s5,   7*REGBYTES(a1)
+    LOAD s6,   8*REGBYTES(a1)
+    LOAD s7,   9*REGBYTES(a1)
+    LOAD s8,  10*REGBYTES(a1)
+    LOAD s9,  11*REGBYTES(a1)
+    LOAD s10, 12*REGBYTES(a1)
+    LOAD s11, 13*REGBYTES(a1)
+    ret
+```
+
+2. `proc_run`（`kern/process/proc.c`）
+
 ```c
+void
+proc_run(struct proc_struct *proc)
+{
+    if (proc != current)
+    {
+        bool intr_flag;
+        struct proc_struct *prev = current, *next = proc;
 
+        local_intr_save(intr_flag);
+        {
+            current = proc;
+            // Sv39：MODE=8 在最高 4 位，低 44 位是页表根节点物理页号
+            write_csr(satp, 0x8000000000000000 | (next->pgdir >> RISCV_PGSHIFT));
+            flush_tlb();
+            switch_to(&(prev->context), &(next->context));
+        }
+        local_intr_restore(intr_flag);
+    }
+}
+```
 
+3. `cpu_idle`（`kern/process/proc.c`）
+
+```c
+void
+cpu_idle(void)
+{
+    while (1)
+    {
+        if (current->need_resched)
+        {
+            schedule();
+        }
+    }
+}
+```
+
+4. `schedule`（`kern/schedule/sched.c`）
+
+```c
+void
+schedule(void)
+{
+    bool intr_flag;
+    list_entry_t *le, *last;
+    struct proc_struct *next = NULL;
+
+    local_intr_save(intr_flag);
+    {
+        current->need_resched = 0;
+
+        // idleproc 从链表头开始；普通线程从 current 的下一个开始，绕一圈回到 current
+        last = (current == idleproc) ? &proc_list : &(current->list_link);
+        le = last;
+        do
+        {
+            // 跳过链表头哨兵 &proc_list
+            if ((le = list_next(le)) != &proc_list)
+            {
+                next = le2proc(le, list_link);
+                if (next->state == PROC_RUNNABLE)
+                {
+                    break;
+                }
+            }
+        } while (le != last);
+
+        // 没有就绪线程时退回 idleproc 保底
+        if (next == NULL || next->state != PROC_RUNNABLE)
+        {
+            next = idleproc;
+        }
+
+        next->runs++;
+        if (next != current)
+        {
+            proc_run(next);
+        }
+    }
+    local_intr_restore(intr_flag);
+}
 ```
 
 **功能说明：**
 
+1. `void switch_to(struct context *from, struct context *to)`
 
+   这是最底层的上下文切换。它把当前线程的 `ra`、`sp`、`s0`~`s11` 保存到 `from->context` 的对应位置，再把 `to->context` 里的同一组寄存器恢复到 CPU 上，最后通过 `ret` 跳到 `to->context.ra`。因为线程切换发生在内核态，`a0`~`a7`、`t0`~`t6` 这些调用者保存寄存器由编译器在 `proc_run` 调用 `switch_to` 的调用点负责，所以这里只保存被调用者保存寄存器。`struct context` 的字段顺序和 8 字节偏移必须与汇编完全一致，否则恢复出来的 `sp`、`ra` 会错位。
 
+2. `void proc_run(struct proc_struct *proc)`
+
+   调度器选出下一个线程后，由 `proc_run` 完成真正的切换。它先判断 `proc` 是否就是 `current`，是则直接返回；否则在关中断的临界区内把 `current` 指向 `proc`，把 `satp` 写成 Sv39 模式加 `proc->pgdir` 的物理页号，执行 `sfence.vma` 刷新 TLB，最后调用 `switch_to` 保存旧线程上下文、恢复新线程上下文。这里要求 `proc->pgdir` 是页表根节点的物理地址，不能是虚拟地址；也不能使用 `libs/riscv.h` 里的 `lsatp()`，因为它是 Sv32 的遗留写法，无法表达 Sv39 的 `satp`。
+
+3. `void cpu_idle(void)`
+
+   `idleproc` 的执行主体。`idleproc` 永远就绪、不会被阻塞，是调度器的保底线程。`cpu_idle` 在一个无限循环里检查 `current->need_resched`，为真就调用 `schedule()` 让出 CPU；没有可运行线程时它就继续空转。函数声明为 `noreturn`，不能返回。
+
+4. `void schedule(void)`
+
+   调度器的核心。它先关中断，把 `current->need_resched` 清零，然后从 `proc_list` 里选下一个处于 `PROC_RUNNABLE` 的线程：如果当前是 `idleproc`，从链表头开始找；否则从 `current` 的下一个开始找，绕一圈回到 `current`，实现轮转。找不到就退回 `idleproc` 保底。选中后 `next->runs++`，只有 `next != current` 时才调用 `proc_run`。整个过程必须在 `local_intr_save/restore` 的临界区内，否则定时器中断可能在“选好 next、还没切换”的中间状态再次进入 `schedule`，破坏 `current` 和 `proc_list` 的一致性。
 
 
 #### 最终提示词
@@ -368,8 +510,76 @@ Requirements:
 以下是经过迭代优化后，最终成功实现该功能的提示词：
 
 ````markdown
+[PROMPT]
+任务：只修改 kern/process/switch.S、kern/schedule/sched.c、kern/process/proc.c 中
+“//LAB4 function3”标记处，实现 Lab4 功能模块三“进程调度”：
+switch_to、proc_run、cpu_idle、schedule。
+保留所有已有代码和其他标记，不要修改 kern/mm/pmm.c、proc.c 的 function2、
+proc.h、sched.h、sync.h、trap/*、init.c。
 
+[RELY]
+1. struct context（kern/process/proc.h）按顺序为：
+   uintptr_t ra, sp, s0, s1, ..., s11; 每个 8 字节，偏移 0,8,16,...,112。
+2. 声明：
+   void switch_to(struct context *from, struct context *to);  // 参数在 a0/a1
+   void proc_run(struct proc_struct *proc);
+   void schedule(void);
+   void cpu_idle(void) __attribute__((noreturn));
+3. 全局量：current、idleproc、proc_list 已在 proc.c 定义并在 proc.h 声明。
+4. struct proc_struct 字段：state、pid、runs、kstack、need_resched、parent、mm、
+   context、tf、pgdir、flags、name、list_link、hash_link。
+5. 状态：PROC_RUNNABLE；le2proc(le, list_link)；list_next()；
+   local_intr_save/local_intr_restore（sync.h）。
+6. riscv.h：SATP_MODE_SV39=8、RISCV_PGSHIFT=12、write_csr/read_csr；
+   pmm.h：flush_tlb()；pmm.c 的 enable_paging() 是 Sv39 satp 写法参照：
+   write_csr(satp, 0x8000000000000000 | (boot_pgdir_pa >> RISCV_PGSHIFT))。
+7. next->pgdir 是页表根节点的物理地址（不是虚拟地址）。
 
+[GUARANTEE]
+1. switch_to：保存 from 的 ra/sp/s0..s11 到 from->context 对应偏移；
+   加载 to 的 ra/sp/s0..s11；最后 ret 返回到 to->context.ra。
+   只保存 callee-saved，不保存 a0/a1/t0..t6。
+2. proc_run：proc == current 时直接返回；否则关中断，current = proc，
+   写 satp 为 Sv39 + (proc->pgdir >> 12)，flush_tlb()，
+   switch_to(&prev->context, &next->context)，最后恢复中断。
+3. cpu_idle：while (1) { if (current->need_resched) schedule(); }，不得返回。
+4. schedule：关中断；current->need_resched = 0；
+   current == idleproc 时从 proc_list 头开始，否则从 current->list_link 之后开始；
+   找第一个 PROC_RUNNABLE；找不到则 next = idleproc；next->runs++；
+   next != current 时 proc_run(next)；最后恢复中断。
+5. 所有对 current/proc_list/need_resched 的修改都在 local_intr_save/restore 临界区内。
+6. 不使用 lsatp()（Sv32）；不把 pgdir 当虚拟地址；不重复右移 12 位；
+   写 satp 后必须刷 TLB。
+
+[SPECIFICATION]
+## switch_to
+Pre: from、to 指向有效 context；from 是当前线程，to 是目标线程。
+Post: from 的 ra/sp/s0..s11 已保存；CPU 寄存器已恢复为 to 的值；
+      执行流返回到 to->context.ra；不修改内存中的其他字段。
+
+## proc_run
+Pre: proc 是有效 PCB；可能在中断开启或关闭的上下文调用。
+Post: proc == current 时无副作用返回；否则 current == proc，
+      satp 指向 proc->pgdir（Sv39），TLB 已刷新，
+      当前 CPU 上下文已切换到 proc；返回时“当前线程”是 proc。
+
+## cpu_idle
+Pre: current == idleproc，proc_init 已把 idleproc->need_resched 置 1。
+Post: 永不返回；每次 need_resched 为真时调用 schedule()。
+
+## schedule
+Pre: current 有效；proc_list 可能为空；调用者可能持有或不持有中断。
+Post: 选中一个 PROC_RUNNABLE 线程；若没有则选 idleproc；
+      current->need_resched 清零；next->runs 加一；
+      next != current 时完成一次 proc_run；返回时中断状态恢复到进入前。
+Cases:
+  Case 1: current != idleproc，从 current 之后轮转，回到 current 停止。
+  Case 2: current == idleproc，从 proc_list 头开始。
+  Case 3: 没有 RUNNABLE，next = idleproc 保底。
+  Case 4: next == current，不调用 proc_run，只增加 runs。
+  Case 5: proc_list 为空，仍能安全返回/切到 idleproc。
+验收：make 编译通过；make qemu 打印 initproc 三行；
+      make grade 的 [Test Schedule] PASS，总分 30/30。
 ````
 
 #### 实现迭代过程
@@ -380,36 +590,56 @@ Requirements:
 
 **遇到的问题：**
 
-
+1. 第一版提示词只写了“实现 switch_to、schedule、proc_run、cpu_idle”，没有给出 `struct context` 的字段顺序和 8 字节偏移。生成的 `switch_to` 如果把 `ra`、`sp`、`s0`~`s11` 的顺序写错，或者把 `a0`~`a7` 也保存进来，就会和 `proc.c` 里的 `struct context` 对不上，`switch_to` 返回后跳到错误地址。
+2. 第一版没有强调 `satp` 的写法。AI 容易直接调用 `libs/riscv.h` 里的 `lsatp()`，但它是 Sv32 遗留，模式位是 `SATP32_MODE`，在 Sv39 下会把 `satp` 写错；也容易把 `boot_pgdir_va` 当成页表物理地址，导致 `satp` 指向一个虚拟地址。
+3. 第一版没有强调临界区。`schedule` 和 `proc_run` 如果不在 `local_intr_save/restore` 里，定时器中断可能在“选好 next、还没切换”的中间状态再次进入 `schedule`，造成嵌套调度。
 
 **问题解决策略：**
 
-
+把 `struct context` 的 14 个字段和偏移直接写进 `[RELY]`，要求 `switch_to` 只保存 callee-saved 的 `ra`、`sp`、`s0`~`s11`，并在生成后先用 `objdump` 逐条核对 14 个 `sd`/`ld` 的偏移；把 `satp` 的写法固定为 `0x8000000000000000 | (next->pgdir >> RISCV_PGSHIFT)`，明确 `next->pgdir` 是 `boot_pgdir_pa` 这样的物理地址，并说明不能使用 `lsatp()`；在 `[GUARANTEE]` 里要求 `schedule`、`proc_run` 的所有共享状态修改都在 `local_intr_save/restore` 内完成。
 
 ##### 第二次迭代
 
 **遇到的问题：**
 
+1. 联调前发现，C 的 `schedule` 依赖 B 的 `proc_init` 和 `copy_thread`，但两人的接口只写在聊天里，没有落到仓库文档。如果 B 把 `idleproc` 挂进 `proc_list`，`schedule` 从 `initproc` 轮转时可能选中 `idleproc`，切过去后 `cpu_idle` 发现 `need_resched=0` 就不再调度，Schedule 测试会挂起。
+2. GCC 15 把 `kern/mm/kmalloc.c` 里的 `kva2page(kva)`（`kva` 是 `unsigned long`）的隐式 `int-conversion` 当成 error，导致整个工程在 C 的代码之前就编不过。
 
 **问题解决策略：**
 
-
+新增 `docs/BC接口约定.md`，把 `struct context` 布局、`copy_thread` 的 `context.ra/sp` 和 `tf.gpr.s0/s1`、`pgdir` 必须是 `boot_pgdir_pa`、`idleproc` 不挂 `proc_list`、`switch_to` 的 ABI 写成文字，B/C 各自按约定实现；在 `kmalloc.c` 里把 `kva2page(kva)` 改成 `kva2page((void *)kva)`，只做显式类型转换，不改变分配逻辑，并在提交说明里注明这是 GCC 15 的构建兼容性修复。
 
 **最终结果：**
 
+经过 2 次迭代，该模块最终：
 
+- 编译通过（`make` 只在链接阶段缺少 B 的 `proc_init`，C 的四个函数均已编译并解析）
+- `switch_to` 反汇编核对通过：14 条 `sd` + 14 条 `ld`，偏移 `0/8/16/.../104`，最后 `ret`
+-  `proc_run` 反汇编核对通过：有 `csrr sstatus`、`csrw satp`、`sfence.vma`，并通过 `jalr` 调用 `switch_to`
+-  `make qemu` 和 `[Test Schedule] PASS` 待 B 的 `proc_init` 合入后验证
 
 **关键改进点总结：**
 
-
+1. 在 `[RELY]` 中把 `struct context` 的字段顺序和偏移写死，避免汇编与 C 结构体错位。
+2. 在 `[GUARANTEE]` 中明确 `satp` 的 Sv39 写法、`pgdir` 的物理地址语义和 `sfence.vma`，避免误用 `lsatp()` 或漏刷 TLB。
+3. 把 `schedule`、`proc_run` 的临界区要求写进提示词，保证 `current`、`proc_list`、`satp`、上下文切换的原子性。
+4. 把 B/C 的跨人接口从聊天内容固化成 `docs/BC接口约定.md`，减少联调时的假设。
 
 #### 验证结果
 
+C 的代码已经通过编译和静态反汇编验证：`switch_to` 的 14 个寄存器偏移与 `struct context` 完全一致，`proc_run` 中能看到 `satp` 写入、`sfence.vma` 和 `switch_to` 调用；当前 `make` 只剩 B 的 `proc_init` 未定义。等 B 的 `proc_init` 合入后，按 `make qemu` 和 `make grade` 补充运行结果与截图。
 
-### challenge题目1
+### Challenge题目1：说明语句 `local_intr_save(intr_flag); ... local_intr_restore(intr_flag);` 是如何实现开关中断的。
 
+`local_intr_save(intr_flag); ... local_intr_restore(intr_flag);` 是 ucore 里最常用的“保存并关闭中断”和“恢复中断”配对。它并不是简单地把中断一关一开，而是先记住进入临界区之前中断到底是开着还是关着，退出时再恢复原状。
 
-### challenge题目2
+先看 `local_intr_save`。它在 `kern/sync/sync.h` 里定义为一个宏，展开后是 `do { intr_flag = __intr_save(); } while (0)`，其中 `intr_flag` 是 `bool`。`__intr_save()` 先读 `sstatus` 的 `SIE` 位：如果原来 `SIE=1`，说明中断是开着的，就调用 `intr_disable()` 把 `SIE` 清 0，并返回 1；如果原来 `SIE=0`，说明已经处在临界区里，就什么都不做，返回 0。`intr_disable()` 和 `intr_enable()` 在 `kern/driver/intr.c` 里，分别是对 `sstatus` 的 `SIE` 位做 `clear_csr` 和 `set_csr`。
+
+再看 `local_intr_restore`。它展开为 `__intr_restore(intr_flag)`：只有当 `intr_flag` 为真时才调用 `intr_enable()`。也就是说，如果进入时中断本来是关的，退出时不会擅自打开；如果进入时是开的，退出时才恢复打开。这样做的关键原因是“嵌套”：假设外层已经关中断，内层再调用 `local_intr_save`，读到的 `SIE=0`，`intr_flag=0`；内层退出时 `local_intr_restore(0)` 不会开中断，必须等外层退出、`intr_flag=1` 时才真正打开。如果实现成“无脑关、无脑开”，内层退出就会提前打开中断，外层临界区被破坏。
+
+在 `schedule` 和 `proc_run` 里，这个配对保护的是“调度决策 + 切换”这一整段：`schedule` 要清 `current->need_resched`、遍历 `proc_list`、选 `next`、增加 `runs`，`proc_run` 要改 `current`、写 `satp`、刷 TLB、调用 `switch_to`。这些步骤之间如果被定时器中断打断，中断处理里又调用 `schedule`，就可能出现嵌套调度：`current` 已经指向新线程，但 CPU 还在旧线程的栈上跑，`satp` 和上下文也可能只切了一半。关中断让这段代码变成不可分割的原子操作，保证 `current`、页表、上下文三者一致。
+
+### Challenge题目2
 
 **1.get_pte() 函数中有两段形式类似的代码，结合 sv32、sv39、sv48 的异同，解释这两段代码为什么如此相像。**
 
@@ -434,13 +664,47 @@ get_pte() 在 Sv39 下要走三级页表：先用线性地址的最高一段索�
 
 **测试截图：**
 
+截图待 `make qemu` 和 `make grade` 跑通后补充，计划放在 `report/images/` 下：
+
+- `lab4_qemu_initproc.png`：`make qemu` 打印 `this initproc` 三行；
+- `lab4_grade_schedule.png`：`make grade` 的 `[Test Schedule] PASS` 和 `Total Score: 30/30`。
 
 **编译与运行：**
 
+在 Ubuntu/WSL 的 `~/lab4/code` 下执行：
+```bash
+make clean
+make
+make qemu
+```
 
+当前 C 的代码已经编译通过；`make` 只在链接阶段缺 B 的 `proc_init`，等 B 的 function2 合入后即可生成 `bin/kernel`。`make qemu` 的预期输出为：
+```text
+this initproc, pid = 1, name = "init"
+To U: "Hello world!!".
+To U: "en.., Bye, Bye. :)".
+kernel panic at kern/process/proc.c:...:
+    process exit!!.
+```
+
+最后的 `process exit!!.` 是 lab4 里 `do_exit` 的 panic 桩，属于预期行为。
 
 **测试结果：**
 
+C 的调度模块目前完成了两项静态验证：
+
+1. `switch_to` 反汇编：14 条 `sd` + 14 条 `ld`，偏移 `0/8/16/.../104`，最后 `ret`，与 `struct context` 一致；
+2. `proc_run` 反汇编：能看到 `csrr sstatus`、`csrw satp`、`sfence.vma`，并通过 `jalr` 调用 `switch_to`。
+
+`make grade` 的三项测试（PMM、Process Create、Schedule）需要 B 的 `proc_init` 合入后才能完整运行；目标输出为：
+```text
+check PMM: OK
+check Process Create: OK
+check Schedule: OK
+Total Score: 30/30
+```
+
+等实际跑通后，再把截图和完整日志补到 `report/images/`。
 
 ## 六、实验总结与收获
 
@@ -448,11 +712,25 @@ get_pte() 在 Sv39 下要走三级页表：先用线性地址的最高一段索�
 
 #### 1. 本实验知识点与 OS 原理知识点的对照
 
-
+| 实验中的知识点 | 对应 OS 原理中的知识点 | 含义、关系与差异 |
+| --- | --- | --- |
+| `struct proc_struct` / PCB | 进程控制块（PCB） | 实验里的 PCB 保存状态、PID、内核栈、上下文、页表根节点等；原理中的 PCB 是进程存在的唯一标志。实验只做内核线程，PCB 的 `mm` 字段暂为空，原理中的 PCB 还要管理用户地址空间、文件等资源。 |
+| `switch_to` / 上下文切换 | 进程、线程上下文切换 | 实验只保存 callee-saved 的 `ra`、`sp`、`s0`~`s11`，caller-saved 由编译器在调用点保存；原理中的上下文切换还包括页表、栈指针、寄存器等，实际硬件还要考虑 TLB、缓存。 |
+| `schedule` / FIFO、轮转 | 进程调度算法 | 实验用 `proc_list` 做简单的 FIFO 和轮转，`idleproc` 保底；原理中还有优先级、多级反馈队列、CFS 等，实验只实现最基础的一种。 |
+| `satp` / TLB | 页表基址寄存器 / TLB | 实验写 `satp` 后手动执行 `sfence.vma`；原理中进程切换要切换页表并处理 TLB 一致性，RISC-V 的 `satp` 与 x86 的 CR3 行为不同。 |
+| `local_intr_save/restore` | 关中断 / 临界区 | 实验用保存 `sstatus.SIE` 的方式实现可嵌套的临界区；原理中的关中断、自旋锁、信号量都是互斥手段，实验只用了最底层的一种。 |
+| 内核线程 | 线程 / 轻量级进程 | 实验中的内核线程共享内核地址空间，只切换上下文；原理中的线程还分用户级和内核级，用户进程有独立地址空间。 |
 
 #### 2. OS 原理中重要、但本实验没有对应上的知识点
 
+本实验的重点是“内核线程的创建、调度和上下文切换”，所以 OS 原理里还有不少内容没有覆盖：
 
+1. 用户态进程与系统调用：实验四的线程都运行在内核态，没有特权级切换，也没有 `fork/exec/wait` 的用户态接口；这些要等 lab5。
+2. 进程同步与死锁：实验只用了关中断保护临界区，没有信号量、管程、条件变量，也没有死锁检测和避免。
+3. 页面置换与缺页异常：实验四的地址空间是预映射的，没有按需分页和页面置换；这些在 lab3 和 lab5 之后才涉及。
+4. 多核调度与负载均衡：实验假设单核，`schedule` 只维护一个 `proc_list`，没有 per-CPU 运行队列、CPU 亲和性和负载均衡。
+5. 文件系统与进程间通信：实验没有文件、管道、共享内存等资源管理；这些在后续实验和课程里。
+6. 实时调度与优先级反转：实验只有 FIFO 和轮转，没有优先级、时间片、实时约束。
 
 ### AI 协作开发的经验
 
@@ -468,5 +746,5 @@ get_pte() 在 Sv39 下要走三级页表：先用线性地址的最高一段索�
 
 
 **成员C（张欣妍 2410699）**：
-
+这次我最大的体会是，汇编和 C 结构体之间的“约定”不能靠自然语言模糊描述。`switch_to` 只有十几条指令，但只要 `struct context` 的字段顺序或偏移错一个，qemu 就会直接跑飞，而且很难从现象反推原因。后来我改成先把 `ra`、`sp`、`s0`~`s11` 的偏移表、`satp` 的 Sv39 写法、`proc_run` 的临界区要求写进 prompt 的 `[RELY]`、`[GUARANTEE]`，再让 AI 生成；生成后不急着跑 qemu，而是先用 `objdump` 逐条核对 `sd`/`ld` 的偏移和 `csrw satp`、`sfence.vma`，确认汇编层面对了，再进入联调。另一个体会是 `proc.c` 是 B/C 共用文件，必须只改自己的 `function3` 标记，并且把跨人的接口（`pgdir` 物理地址、`idleproc` 不挂 `proc_list`、`copy_thread` 的 `context.ra/sp`）写成 `docs/BC接口约定.md`，否则联调时会出现“代码都对、接口对不上”的问题。最后，GCC 15 对 `int-conversion` 的处理也提醒我，构建环境本身也是实验的一部分，遇到框架文件的类型错误要单独定位，不要把它和业务代码的 bug 混在一起。
 
