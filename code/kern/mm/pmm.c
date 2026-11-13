@@ -292,7 +292,7 @@ struct Page *get_page(pde_t *pgdir, uintptr_t la, pte_t **ptep_store)
 
 
 
-//LAB4 2411433
+//LAB4 function1 2411433
 
 // page_remove_pte - 撤销一个已知的页表项（ptep 必须由 get_pte 得到）
 static inline void page_remove_pte(pde_t *pgdir, uintptr_t la, pte_t *ptep)
