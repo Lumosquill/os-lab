@@ -218,7 +218,147 @@ init_main(void *arg)
     return 0;
 }
 
-//LAB4 function2 YOUR CODE
+//LAB4 function2 2411570
+
+// alloc_proc - 分配一个 proc_struct 并把它初始化为"刚创建、尚未运行"的状态
+static struct proc_struct *
+alloc_proc(void)
+{
+    struct proc_struct *proc = kmalloc(sizeof(struct proc_struct));
+    if (proc != NULL)
+    {
+        memset(proc, 0, sizeof(struct proc_struct)); // 所有字段先清零：context、tf、mm、flags、name 等都是安全的空值
+        proc->state = PROC_UNINIT;                   // 已创建，还没有进入调度
+        proc->pid = -1;                              // pid 还没分配
+        proc->pgdir = boot_pgdir_pa;                 // 内核线程共用内核页表，这里必须是物理地址
+    }
+    return proc;
+}
+
+// copy_mm - 内核线程共享内核地址空间，本实验不需要复制 mm
+static int
+copy_mm(uint32_t clone_flags, struct proc_struct *proc)
+{
+    assert(current->mm == NULL); // 内核线程没有用户地址空间
+    return 0;
+}
+
+// copy_thread - 在新线程的内核栈顶放置 trapframe，并设置首次运行用的 context
+static void
+copy_thread(struct proc_struct *proc, uintptr_t esp, struct trapframe *tf)
+{
+    // trapframe 放在内核栈的最高处，栈从它下面向低地址增长
+    proc->tf = (struct trapframe *)(proc->kstack + KSTACKSIZE - sizeof(struct trapframe));
+    *(proc->tf) = *tf;
+    proc->tf->gpr.a0 = 0; // 子线程的返回值为 0
+    // esp 为 0 表示内核线程，使用自己内核栈上 trapframe 的位置作为栈顶，否则 sret 之后 sp 就是 0
+    proc->tf->gpr.sp = (esp == 0) ? (uintptr_t)proc->tf : esp;
+
+    proc->context.ra = (uintptr_t)forkret;      // 第一次 switch_to 之后返回到 forkret
+    proc->context.sp = (uintptr_t)(proc->tf);   // forkret 运行时的栈从 trapframe 下面开始
+}
+
+// do_fork - 创建新线程：分配 PCB、内核栈，复制内存管理与 trapframe，登记并设为就绪
+int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
+{
+    int ret = -E_NO_FREE_PROC;
+    struct proc_struct *proc;
+    if (nr_process >= MAX_PROCESS)
+    {
+        goto fork_out;
+    }
+    ret = -E_NO_MEM;
+
+    if ((proc = alloc_proc()) == NULL)
+    {
+        goto fork_out;
+    }
+    proc->parent = current; // 父进程就是调用 do_fork 的当前线程
+
+    if (setup_kstack(proc) != 0)
+    {
+        goto bad_fork_cleanup_proc;
+    }
+    if (copy_mm(clone_flags, proc) != 0)
+    {
+        goto bad_fork_cleanup_kstack;
+    }
+    copy_thread(proc, stack, tf);
+
+    // pid 分配、哈希表和链表插入、计数必须作为一个整体，期间关中断
+    bool intr_flag;
+    local_intr_save(intr_flag);
+    {
+        proc->pid = get_pid();
+        hash_proc(proc);
+        list_add(&proc_list, &(proc->list_link));
+        nr_process++;
+    }
+    local_intr_restore(intr_flag);
+
+    wakeup_proc(proc); // UNINIT -> RUNNABLE
+    ret = proc->pid;
+
+fork_out:
+    return ret;
+
+bad_fork_cleanup_kstack:
+    put_kstack(proc);
+bad_fork_cleanup_proc:
+    kfree(proc);
+    goto fork_out;
+}
+
+// kernel_thread - 构造临时 trapframe，再调用 do_fork 创建内核线程
+int kernel_thread(int (*fn)(void *), void *arg, uint32_t clone_flags)
+{
+    struct trapframe tf;
+    memset(&tf, 0, sizeof(struct trapframe));
+    tf.gpr.s0 = (uintptr_t)fn;  // kernel_thread_entry 会跳转到 s0
+    tf.gpr.s1 = (uintptr_t)arg; // 并把 s1 作为参数传进去
+    // SPP=1：sret 后回到内核态；SPIE=1：sret 后打开中断；SIE=0：恢复寄存器的过程中不被打断
+    tf.status = (read_csr(sstatus) | SSTATUS_SPP | SSTATUS_SPIE) & ~SSTATUS_SIE;
+    tf.epc = (uintptr_t)kernel_thread_entry; // 线程第一次运行的入口
+    return do_fork(clone_flags | CLONE_VM, 0, &tf);
+}
+
+// proc_init - 把当前执行现场包装成 idleproc，并创建第一个内核线程 initproc
+void proc_init(void)
+{
+    int i;
+
+    list_init(&proc_list);
+    for (i = 0; i < HASH_LIST_SIZE; i++)
+    {
+        list_init(hash_list + i);
+    }
+
+    if ((idleproc = alloc_proc()) == NULL)
+    {
+        panic("cannot alloc idleproc.\n");
+    }
+
+    idleproc->pid = 0;
+    idleproc->state = PROC_RUNNABLE;
+    idleproc->kstack = (uintptr_t)bootstack; // 复用启动时的栈
+    idleproc->need_resched = 1;              // 让 cpu_idle 一进来就调度
+    set_proc_name(idleproc, "idle");
+    nr_process++;
+
+    current = idleproc; // 必须先设置 current，后面创建的 initproc 的 parent 才是 idleproc
+
+    int pid = kernel_thread(init_main, "Hello world!!", 0);
+    if (pid <= 0)
+    {
+        panic("create init_main failed.\n");
+    }
+
+    initproc = find_proc(pid);
+    set_proc_name(initproc, "init");
+
+    assert(idleproc != NULL && idleproc->pid == 0);
+    assert(initproc != NULL && initproc->pid == 1);
+}
 
 
 //LAB4 function3 2410699

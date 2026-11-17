@@ -1,4 +1,4 @@
-# OSlab3 实验报告
+# OSLab4 实验报告
 
 ## 实验基本信息
 
@@ -6,14 +6,14 @@
 | -------- | ----------------------------------- |
 | **实验名称** | Lab 4: 进程管理                      |
 | **小组成员** | 2411570-何美璇、2410699-张欣妍、2411433-李烁菲 |
-| **完成日期** | 2026-11-                           |
+| **完成日期** | 2026-11-17                        |
 
 ### 小组分工
 
 | 成员          | 负责的练习/模块         | 负责的实验报告模块                    |
 | ----------- | ---------------- | ---------------------------- |
 | 2411433-李烁菲 | 功能模块一+challenge2 | 实验目的，逻辑主线，模块一和challenge2相关部分 |
-| 2411570-何美璇 |                  |                              |
+| 2411570-何美璇 | 功能模块二 | 模块二、测试截图 |
 | 2410699-张欣妍 | 功能模块三+challenge1 | 模块三、challenge1、调度测试与总结       |
 
 ## 一、实验目的
@@ -39,11 +39,11 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 运行环境 | WSL2 / Ubuntu 26.04 LTS |
-| 交叉编译器 | `riscv64-unknown-elf-gcc` 15.1.0 |
-| 交叉调试器 | `riscv64-unknown-elf-gdb` 16.3 |
+| 运行环境 | WSL2 / Ubuntu 24.04.5 LTS |
+| 交叉编译器 | `riscv64-unknown-elf-gcc` 13.2.0 |
+| 交叉调试器 | `gdb-multiarch` 15.1 |
 | 模拟器 | `qemu-system-riscv64` 4.1.1 |
-| 构建工具 | GNU Make 4.4.1 |
+| 构建工具 | GNU Make 4.3 |
 
 
 ## 三、实验整体逻辑分析
@@ -300,53 +300,440 @@ Requirements:
 
 
 
-### 功能模块二：
+### 功能模块二：进程创建及初始化功能
 
-**负责人：** 
+**负责人：** 2411570-何美璇
 
 #### 模块功能描述
 
 **需要实现的函数：**
 
 ```c
+//LAB4 function2 2411570
 
+// alloc_proc - 分配一个 proc_struct 并把它初始化为"刚创建、尚未运行"的状态
+static struct proc_struct *
+alloc_proc(void)
+{
+    struct proc_struct *proc = kmalloc(sizeof(struct proc_struct));
+    if (proc != NULL)
+    {
+        memset(proc, 0, sizeof(struct proc_struct)); // 所有字段先清零：context、tf、mm、flags、name 等都是安全的空值
+        proc->state = PROC_UNINIT;                   // 已创建，还没有进入调度
+        proc->pid = -1;                              // pid 还没分配
+        proc->pgdir = boot_pgdir_pa;                 // 内核线程共用内核页表，这里必须是物理地址
+    }
+    return proc;
+}
 
+// copy_mm - 内核线程共享内核地址空间，本实验不需要复制 mm
+static int
+copy_mm(uint32_t clone_flags, struct proc_struct *proc)
+{
+    assert(current->mm == NULL); // 内核线程没有用户地址空间
+    return 0;
+}
+
+// copy_thread - 在新线程的内核栈顶放置 trapframe，并设置首次运行用的 context
+static void
+copy_thread(struct proc_struct *proc, uintptr_t esp, struct trapframe *tf)
+{
+    // trapframe 放在内核栈的最高处，栈从它下面向低地址增长
+    proc->tf = (struct trapframe *)(proc->kstack + KSTACKSIZE - sizeof(struct trapframe));
+    *(proc->tf) = *tf;
+    proc->tf->gpr.a0 = 0; // 子线程的返回值为 0
+    // esp 为 0 表示内核线程，使用自己内核栈上 trapframe 的位置作为栈顶，否则 sret 之后 sp 就是 0
+    proc->tf->gpr.sp = (esp == 0) ? (uintptr_t)proc->tf : esp;
+
+    proc->context.ra = (uintptr_t)forkret;      // 第一次 switch_to 之后返回到 forkret
+    proc->context.sp = (uintptr_t)(proc->tf);   // forkret 运行时的栈从 trapframe 下面开始
+}
+
+// do_fork - 创建新线程：分配 PCB、内核栈，复制内存管理与 trapframe，登记并设为就绪
+int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
+{
+    int ret = -E_NO_FREE_PROC;
+    struct proc_struct *proc;
+    if (nr_process >= MAX_PROCESS)
+    {
+        goto fork_out;
+    }
+    ret = -E_NO_MEM;
+
+    if ((proc = alloc_proc()) == NULL)
+    {
+        goto fork_out;
+    }
+    proc->parent = current; // 父进程就是调用 do_fork 的当前线程
+
+    if (setup_kstack(proc) != 0)
+    {
+        goto bad_fork_cleanup_proc;
+    }
+    if (copy_mm(clone_flags, proc) != 0)
+    {
+        goto bad_fork_cleanup_kstack;
+    }
+    copy_thread(proc, stack, tf);
+
+    // pid 分配、哈希表和链表插入、计数必须作为一个整体，期间关中断
+    bool intr_flag;
+    local_intr_save(intr_flag);
+    {
+        proc->pid = get_pid();
+        hash_proc(proc);
+        list_add(&proc_list, &(proc->list_link));
+        nr_process++;
+    }
+    local_intr_restore(intr_flag);
+
+    wakeup_proc(proc); // UNINIT -> RUNNABLE
+    ret = proc->pid;
+
+fork_out:
+    return ret;
+
+bad_fork_cleanup_kstack:
+    put_kstack(proc);
+bad_fork_cleanup_proc:
+    kfree(proc);
+    goto fork_out;
+}
+
+// kernel_thread - 构造临时 trapframe，再调用 do_fork 创建内核线程
+int kernel_thread(int (*fn)(void *), void *arg, uint32_t clone_flags)
+{
+    struct trapframe tf;
+    memset(&tf, 0, sizeof(struct trapframe));
+    tf.gpr.s0 = (uintptr_t)fn;  // kernel_thread_entry 会跳转到 s0
+    tf.gpr.s1 = (uintptr_t)arg; // 并把 s1 作为参数传进去
+    // SPP=1：sret 后回到内核态；SPIE=1：sret 后打开中断；SIE=0：恢复寄存器的过程中不被打断
+    tf.status = (read_csr(sstatus) | SSTATUS_SPP | SSTATUS_SPIE) & ~SSTATUS_SIE;
+    tf.epc = (uintptr_t)kernel_thread_entry; // 线程第一次运行的入口
+    return do_fork(clone_flags | CLONE_VM, 0, &tf);
+}
+
+// proc_init - 把当前执行现场包装成 idleproc，并创建第一个内核线程 initproc
+void proc_init(void)
+{
+    int i;
+
+    list_init(&proc_list);
+    for (i = 0; i < HASH_LIST_SIZE; i++)
+    {
+        list_init(hash_list + i);
+    }
+
+    if ((idleproc = alloc_proc()) == NULL)
+    {
+        panic("cannot alloc idleproc.\n");
+    }
+
+    idleproc->pid = 0;
+    idleproc->state = PROC_RUNNABLE;
+    idleproc->kstack = (uintptr_t)bootstack; // 复用启动时的栈
+    idleproc->need_resched = 1;              // 让 cpu_idle 一进来就调度
+    set_proc_name(idleproc, "idle");
+    nr_process++;
+
+    current = idleproc; // 必须先设置 current，后面创建的 initproc 的 parent 才是 idleproc
+
+    int pid = kernel_thread(init_main, "Hello world!!", 0);
+    if (pid <= 0)
+    {
+        panic("create init_main failed.\n");
+    }
+
+    initproc = find_proc(pid);
+    set_proc_name(initproc, "init");
+
+    assert(idleproc != NULL && idleproc->pid == 0);
+    assert(initproc != NULL && initproc->pid == 1);
+}
 ```
 
 **功能说明：**
 
+1. `static struct proc_struct *alloc_proc(void)`
 
+   分配一个 `proc_struct`，并把它初始化为"刚创建、尚未运行"的状态。
+
+   先把整个结构清零，这样 `context`、`tf`、`mm`、`flags`、`name` 和两个链表节点都是安全的空值。再设置三个字段：`state` 为 `PROC_UNINIT`，`pid` 为 -1，`pgdir` 为 `boot_pgdir_pa`。内核线程共用内核页表，`pgdir` 之后会被写入 `satp`，所以这里保存的是物理地址。内存不足时返回 NULL。
+
+2. `static int copy_mm(uint32_t clone_flags, struct proc_struct *proc)`
+
+   内核线程共享内核地址空间，不需要复制 `mm`。函数只断言 `current->mm` 为 NULL，然后返回 0。保留这个函数是为了后面实验创建用户进程时继续扩展。
+
+3. `static void copy_thread(struct proc_struct *proc, uintptr_t esp, struct trapframe *tf)`
+
+   在新线程自己的内核栈上布置它第一次运行需要的现场。
+
+   把 trapframe 放在内核栈的最高处，并把传入的 trapframe 复制过去，再把 `a0` 设为 0，表示这是子线程。`esp` 为 0 时说明是内核线程，栈指针设成这个 trapframe 自己所在的位置，线程在这个位置之下向低地址使用栈。最后设置 `context.ra` 为 `forkret`，`context.sp` 为 trapframe 的位置，这样第一次 `switch_to` 之后会返回到 `forkret`，再经过 `forkrets`、`__trapret` 进入线程入口。
+
+4. `int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)`
+
+   创建新线程的主函数，按顺序完成：
+
+   - 检查进程数是否已达上限，达到则返回 `-E_NO_FREE_PROC`。
+   - 分配并初始化 PCB，把 `parent` 设为 `current`。
+   - 分配内核栈，失败则释放 PCB 并返回 `-E_NO_MEM`。
+   - 调用 `copy_mm`，失败则释放内核栈和 PCB。
+   - 调用 `copy_thread` 设置 trapframe 和 context。
+   - 在关中断的区间内完成 pid 分配、插入哈希表、插入进程链表、进程数加一。
+   - 调用 `wakeup_proc` 把状态改成 `PROC_RUNNABLE`，返回新线程的 pid。
+
+5. `int kernel_thread(int (*fn)(void *), void *arg, uint32_t clone_flags)`
+
+   因为内核启动时没有父进程可以复制，所以手工构造一个临时 trapframe，再交给 `do_fork`。
+
+   临时 trapframe 先整体清零，然后设置 `s0` 为线程函数，`s1` 为参数，`epc` 为 `kernel_thread_entry`。`status` 在当前 `sstatus` 的基础上置 `SPP` 和 `SPIE`，清除 `SIE`：`SPP` 让 `sret` 之后回到内核态，`SPIE` 让 `sret` 之后打开中断，清除 `SIE` 是为了恢复寄存器的过程中不被中断打断。最后调用 `do_fork(clone_flags | CLONE_VM, 0, &tf)`，返回新线程的 pid。
+
+6. `void proc_init(void)`
+
+   初始化进程管理需要的全局结构，并创建 idleproc 和 initproc。
+
+   先初始化 `proc_list` 和 `hash_list`。然后分配 idleproc，把它设为 pid 0、`PROC_RUNNABLE`，内核栈使用启动时的 `bootstack`，`need_resched` 置 1，名字为 "idle"，并把 `current` 指向它。这一步必须在创建 initproc 之前完成，因为 `do_fork` 会把 `current` 记为父进程。之后调用 `kernel_thread(init_main, "Hello world!!", 0)` 创建 initproc，用 `find_proc` 找到它并命名为 "init"，最后断言两个线程的 pid 分别是 0 和 1。
 
 #### 最终提示词
 
 以下是经过迭代优化后，最终成功实现该功能的提示词：
 
-````
+```
+[PROMPT]
+任务：修改文件 kern/process/proc.c，实现“进程创建及初始化”功能模块。该模块负责让内核从只有一条执行流，变成能够创建并登记多个内核线程：把当前执行现场包装成第 0 个内核线程 idleproc，再通过 kernel_thread 和 do_fork 创建第 1 个内核线程 initproc，并在新线程自己的内核栈上布置好它第一次被调度时需要的 trapframe 和 context，使它能够沿着 switch_to、forkret、forkrets、__trapret、kernel_thread_entry 这条路径开始执行。代码放在 proc.c 中标注 “//LAB4 function2 YOUR CODE” 的位置（init_main 之后、“//LAB4 function3 YOUR CODE” 之前）。
 
-````
+操作要求：你必须在项目中修改实际文件，而不是仅展示代码。完成功能模块的实现，包括但不限于：六个函数主体、辅助函数、内部使用的宏。保留现有代码，只在上述标记位置补全，不要修改 get_pid、hash_proc、find_proc、setup_kstack、put_kstack、forkret、init_main、do_exit 等已有函数，也不要修改 function3 标记处以及 sched.c、switch.S 等其他文件。
+
+输出要求：直接进行文件操作，使用下面 [RELY]、[GUARANTEE]、[SPECIFICATION] 部分的信息，以工程真实代码为准，不要引入无关功能。
+
+[RELY]
+// 进程状态与结构（kern/process/proc.h）
+enum proc_state { PROC_UNINIT = 0, PROC_SLEEPING, PROC_RUNNABLE, PROC_ZOMBIE };
+struct context { uintptr_t ra, sp, s0, s1, s2, ..., s11; };   // 切换时保存的 14 个寄存器
+struct proc_struct {
+    enum proc_state state;  int pid;  int runs;  uintptr_t kstack;  volatile bool need_resched;
+    struct proc_struct *parent;  struct mm_struct *mm;  struct context context;
+    struct trapframe *tf;  uintptr_t pgdir;  uint32_t flags;  char name[PROC_NAME_LEN + 1];
+    list_entry_t list_link;  list_entry_t hash_link;
+};
+#define MAX_PROCESS 4096        // 系统允许的最大进程数
+// pgdir 保存页目录的物理地址，进程切换时会被写入 satp
+
+// trapframe（kern/trap/trap.h）
+struct trapframe { struct pushregs gpr; uintptr_t status; uintptr_t epc; uintptr_t badvaddr; uintptr_t cause; };
+// gpr 中包含 sp、a0、s0、s1 等通用寄存器。sret 返回时，epc 是返回地址，status 决定返回后的特权级和中断使能。
+
+// sstatus 位与 CSR 访问（libs/riscv.h）
+SSTATUS_SIE 0x2    // 当前是否允许中断
+SSTATUS_SPIE 0x20  // sret 之后 SIE 的取值
+SSTATUS_SPP 0x100  // sret 之后的特权级：1 表示内核态（S 模式），0 表示用户态
+read_csr(sstatus)
+
+// 全局变量与常量（proc.c / pmm.h / memlayout.h）
+list_entry_t proc_list;                          // 所有进程的链表
+static list_entry_t hash_list[HASH_LIST_SIZE];   // 按 pid 的哈希表
+struct proc_struct *idleproc, *initproc, *current;
+static int nr_process;                           // 当前进程数
+extern uintptr_t boot_pgdir_pa;                  // 内核页表的物理地址
+extern char bootstack[];                         // 启动阶段使用的栈
+#define KSTACKSIZE (KSTACKPAGE * PGSIZE)         // 内核栈大小，KSTACKPAGE 为 2
+#define CLONE_VM 0x00000100                      // 表示共享地址空间
+// 错误码（libs/error.h）
+E_NO_MEM 4        // 返回 -E_NO_MEM
+E_NO_FREE_PROC 5  // 返回 -E_NO_FREE_PROC
+
+// 可用函数（签名以工程为准）
+void *kmalloc(size_t n);  void kfree(void *p);  void *memset(void *s, char c, size_t n);
+static int get_pid(void);                        // 返回当前未被占用的 pid
+static void hash_proc(struct proc_struct *proc); // 按 pid 插入哈希表
+struct proc_struct *find_proc(int pid);
+static int setup_kstack(struct proc_struct *proc);   // 成功返回 0，失败返回 -E_NO_MEM，成功时设置 proc->kstack
+static void put_kstack(struct proc_struct *proc);    // 释放 proc 的内核栈
+char *set_proc_name(struct proc_struct *proc, const char *name);
+void wakeup_proc(struct proc_struct *proc);          // 要求 state 不是 ZOMBIE 和 RUNNABLE，把它设为 RUNNABLE
+void list_init(list_entry_t *elm);  void list_add(list_entry_t *listelm, list_entry_t *elm);  // 加在 listelm 之后
+local_intr_save(x); local_intr_restore(x);       // 关中断/恢复中断，x 是 bool 变量
+static void forkret(void);                       // 已定义：新线程第一次被 switch_to 切换进来后到达这里，调用 forkrets(current->tf)
+void kernel_thread_entry(void);                  // 汇编（process/entry.S）：调用 s0(s1)，返回后调用 do_exit
+static int init_main(void *arg);                 // 已定义：initproc 的入口函数，打印 pid、名字和参数
+
+// 已有的相关调用方（供理解，不要修改）
+// init.c 在 kern_init 中调用 proc_init。
+// tools/test_lab4.c 的 Process Create 测试在 proc_init 结束后检查：
+//   current == idleproc；idleproc 的 pid 为 0、state 为 RUNNABLE、kstack 等于 bootstack、
+//   parent/mm/tf 为 NULL、runs 和 flags 为 0、context.ra 为 0；
+//   initproc 的 pid 为 1、state 为 RUNNABLE、parent 等于 idleproc、mm 为 NULL、context.ra 和 context.sp 不为 0。
+// Schedule 测试会再调用 kernel_thread 创建两个线程，并让三个线程轮流运行。
+
+[GUARANTEE]
+必须实现的主要接口（声明已在 proc.h 中，签名必须一致）：
+static struct proc_struct *alloc_proc(void);
+void proc_init(void);
+int kernel_thread(int (*fn)(void *), void *arg, uint32_t clone_flags);
+int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf);
+static void copy_thread(struct proc_struct *proc, uintptr_t esp, struct trapframe *tf);
+static int copy_mm(uint32_t clone_flags, struct proc_struct *proc);
+
+你可以根据需要添加：
+- 辅助函数（必须设为 static，只在 proc.c 内部使用，不得改变公开接口）
+- 内部使用的宏定义
+
+[SPECIFICATION]
+## alloc_proc
+Pre-Condition:
+- 内核堆分配器 kmalloc 已经初始化。
+
+Post-Condition:
+- 成功时返回一个处于“刚创建、尚未运行”状态的 PCB，之后任何代码读取其中没有被显式赋值的字段，都只会得到安全的空值；失败时返回 NULL。
+
+  Case 1（内存不足）:
+  - kmalloc 失败，返回 NULL，不改变任何其他状态。
+
+  Case 2（成功）:
+  - 状态为未初始化态，pid 为 -1 表示尚未分配，页目录基址 pgdir 为内核页表的物理地址，其余字段（运行次数、内核栈、need_resched、父进程、mm、context、tf、flags、name、两个链表节点）全部为 0 或空。
+
+Requirements:
+- pgdir 必须是物理地址而不是虚拟地址：内核线程共用内核页表，进程切换时这个值会被写入 satp。
+- 不能留下未初始化的随机值：Process Create 测试会检查 idleproc 的 context.ra 为 0、tf 为 NULL、flags 为 0。
+
+## copy_mm
+Pre-Condition:
+- 调用者是内核线程，current 的 mm 为 NULL。
+
+Post-Condition:
+- 返回 0，不创建任何新的地址空间，proc 的 mm 保持为 NULL。
+
+Requirements:
+- 当 current 的 mm 不为 NULL 时，说明这不是内核线程的创建，应当用断言暴露出来，而不是悄悄忽略。
+- 保持函数形态完整，便于后续实验为用户进程扩展。
+
+## copy_thread
+Pre-Condition:
+- proc 已经拥有有效的内核栈；tf 指向调用者准备好的 trapframe；esp 为 0 表示新线程是内核线程。
+
+Post-Condition:
+- proc 的 trapframe 位于它自己内核栈的最高处，内容是传入 trapframe 的拷贝，并且子线程的返回值为 0。proc 的 context 设置为：第一次被 switch_to 切换进来时进入 forkret，并且 forkret 运行时使用的栈位于 trapframe 之下，不会覆盖 trapframe。
+
+  Case 1（esp 为 0，内核线程）:
+  - trapframe 中的栈指针设为该 trapframe 自己所在的地址，线程之后在这个位置之下使用栈。传入的 trapframe 是由 kernel_thread 清零构造的，如果不设置这一项，线程第一次运行时栈指针为 0。
+
+  Case 2（esp 不为 0）:
+  - trapframe 中的栈指针使用调用者给定的 esp。
+
+Requirements:
+- trapframe 必须完整地放在 kstack 到 kstack + KSTACKSIZE 的范围之内。
+- trapframe 中的 epc、status、s0、s1 必须原样保留，它们决定线程第一次运行时从哪里开始、以什么状态运行。
+
+## do_fork
+Pre-Condition:
+- current 是调用 do_fork 的线程；tf 指向要复制给子线程的 trapframe；stack 为 0 表示内核线程。
+
+Post-Condition:
+- 成功时新线程已经创建并登记：它的 pid 在现有进程中唯一，父进程为 current，已加入进程链表和按 pid 的哈希表，进程总数加 1，状态为就绪，函数返回它的 pid。失败时返回负的错误码，并且不留下已经分配却没有释放的资源。
+
+  Case 1（进程数已达上限）:
+  - 返回 -E_NO_FREE_PROC，不分配任何资源。
+
+  Case 2（PCB 分配失败）:
+  - 返回 -E_NO_MEM，没有需要释放的资源。
+
+  Case 3（内核栈分配失败）:
+  - 释放已经分配的 PCB，返回 -E_NO_MEM。
+
+  Case 4（copy_mm 失败）:
+  - 释放已经分配的内核栈和 PCB，返回 -E_NO_MEM。
+
+  Case 5（成功）:
+  - 按上面的 Post-Condition 完成登记，返回新线程的 pid。
+
+Requirements:
+- 父进程必须显式设置为 current：alloc_proc 得到的 parent 为空，Process Create 测试会检查 initproc 的 parent 是 idleproc。
+- pid 分配、插入哈希表、插入进程链表、进程数加 1 必须作为一个整体完成，期间不能被中断打断。
+- 状态从未初始化变为就绪，必须在线程完全登记之后，通过现有的 wakeup_proc 完成。
+- 失败路径按资源分配的相反顺序释放。
+
+## kernel_thread
+Pre-Condition:
+- fn 是线程入口函数，arg 是传给它的参数；current 指向调用者。
+
+Post-Condition:
+- 返回新线程的 pid 或 do_fork 返回的负错误码。新线程第一次运行时在内核态执行 fn(arg)，运行时中断是打开的，fn 返回后进入 do_exit。
+
+  Case 1（do_fork 失败）:
+  - 原样返回错误码。
+
+  Case 2（成功）:
+  - 返回新线程的 pid。
+
+Requirements:
+- 临时 trapframe 先整体清零，再设置：线程函数和参数通过 kernel_thread_entry 约定使用的两个寄存器传递；epc 指向 kernel_thread_entry。
+- status 在当前 sstatus 的基础上要满足三点：sret 之后回到内核态（置 SPP）；sret 之后打开中断（置 SPIE）；恢复寄存器的过程中不接受中断（清 SIE）。漏掉 SPP，线程会回到用户态并在取第一条指令时异常；漏掉 SPIE，线程会在关中断状态下运行，三个测试仍然能通过，因此必须由规格保证。
+- 调用 do_fork 时 clone_flags 要加上 CLONE_VM，stack 参数为 0。
+
+## proc_init
+Pre-Condition:
+- 内存管理已经初始化，kmalloc 可用；此时 current 为空。
+
+Post-Condition:
+- 进程链表和哈希表已初始化为空表；idleproc 是当前执行现场对应的第 0 个线程，current 指向它；initproc 是第 1 个线程，名字为 init，入口为 init_main，参数为 "Hello world!!"，已经就绪等待调度。
+
+  Case 1（idleproc 分配失败）:
+  - 调用 panic 终止初始化。
+
+  Case 2（initproc 创建失败，返回的 pid 不大于 0）:
+  - 调用 panic 终止初始化。
+
+  Case 3（成功）:
+  - idleproc 的 pid 为 0，状态为就绪，内核栈为启动时使用的 bootstack，need_resched 为 1，名字为 idle，不加入 proc_list（它只作为调度器找不到其他线程时的保底选择），进程计数包含它。initproc 的 pid 为 1，父进程为 idleproc，名字为 init。
+
+Requirements:
+- current 必须在调用 kernel_thread 之前就指向 idleproc：do_fork 会把 current 记为父进程，copy_mm 也会读取 current。
+- 实现后应能通过 tools/test_lab4.c 中 Process Create 测试以及 Schedule 测试的全部断言。
+```
 
 #### 实现迭代过程
 
-<font color="">本模块的实现经历了 1 次迭代，过程如下：</font>
+本模块的实现经历了 2 次迭代，过程如下：
 
 ##### 第一次迭代
 
 **遇到的问题：**
 
+第一版提示词只有任务说明和六个函数的名称，每个函数的规格只用一两句话概括，没有拆分 Case，[RELY] 里也只列了结构体和函数名。AI 生成的代码可以编译通过，但有三处漏掉了提示词没有写明的隐含条件：
 
+1. `do_fork` 没有设置 `proc->parent = current`。`alloc_proc` 得到的 `parent` 本来就是空，代码里没有任何地方给它赋值。运行 Process Create 测试时，在 `initproc->parent == idleproc && initproc->mm == NULL` 这一条断言处失败，系统 panic。
+
+2. `copy_thread` 没有处理 `esp` 为 0 的情况，新线程 trapframe 里的栈指针一直是 0。`kernel_thread` 构造的临时 trapframe 是清零的，`copy_thread` 只是复制了它，没有把栈指针设成内核栈上的位置。这时 Process Create 测试仍然通过，但 initproc 第一次被调度运行时，第一次使用栈就触发存储访问异常（scause 为 7），内核反复进入异常并不断打印 trapframe。
+
+3. `alloc_proc` 没有给 `pgdir` 赋值，保持为 0。这一处最难定位：Process Create 测试通过，进入调度后系统没有任何输出就停住了，原因是切换页表时 `satp` 指向了物理地址 0 处的页表。
 
 **问题解决策略：**
 
+[RELY] 补充了 `pgdir` 的含义（内核页表的物理地址，会被写入 `satp`）、trapframe 各字段的作用，以及 `forkret` 和 `kernel_thread_entry` 的执行过程。[SPECIFICATION] 中，`alloc_proc` 的 Case 写明每个字段的初始值；`copy_thread` 拆成 `esp` 为 0 和不为 0 两个 Case；`do_fork` 的 Requirements 写明父进程必须设为 `current`，并说明对应的测试检查。
 
+##### 第二次迭代
+
+**遇到的问题：**
+
+第二版提示词重新生成后，三个测试都能通过，但对照规格检查并做对比实验时，发现 `kernel_thread` 和 `do_fork` 还有两类问题：
+
+1. `kernel_thread` 对 `status` 的处理不完整。第二版规格只写了"设置 status"，AI 生成的代码只写了 `sstatus | SSTATUS_SPIE`，漏掉了 `SPP`。这样 `sret` 之后 CPU 回到用户态，从内核代码取第一条指令时马上触发指令缺页异常（scause 为 12），异常被反复触发。补上 `SPP` 但漏掉 `SPIE` 时，三个测试仍然全部通过，但新线程是在关中断状态下运行的，测试发现不了这个错误。
+
+2. `do_fork` 的出错处理和保护不完整。`copy_mm` 失败时只释放了 PCB，没有释放已经分配的内核栈，会泄漏两页内存；pid 分配、插入哈希表和链表、进程数加一没有放在关中断的区间里，中断打断时进程链表可能处于半完成状态。这两处没有任何测试会触发，是对照规格检查代码时发现的。
+
+**问题解决策略：**
+
+[SPECIFICATION] 中 `kernel_thread` 的 Requirements 把 `status` 三位逐位写成要满足的行为（回到内核态、返回后打开中断、恢复现场期间不被打断），并写明漏掉 `SPP` 和 `SPIE` 各自的后果。`do_fork` 的失败情况拆成"内核栈分配失败""`copy_mm` 失败"两个 Case，各自写明要释放的资源，并在 Requirements 中要求 pid 分配到进程数加一作为一个整体，期间不被中断打断。
 
 **最终结果：**
 
-
+经过 2 次迭代，最终实现的六个函数满足提示词中的全部约束，能够通过 Process Create 测试，initproc 也能在 Schedule 测试中被正确调度运行。
 
 **关键改进点总结：**
 
-
-
+1. 把 AI 容易漏掉的隐含条件（`parent`、栈指针、`pgdir`、`status` 位）逐条写成 Case 或 Requirements，而不是只写函数的功能。
+2. 对测试检查不到的条件（开中断、失败时的资源回收、关中断区间），在规格里明确写出后果，靠规格而不是测试来保证。
+3. 在 [RELY] 里补充结构体字段和寄存器位的含义，让 AI 知道 `pgdir` 为什么必须是物理地址、`status` 各位起什么作用。
 
 ### 功能模块三：进程调度
 
@@ -616,7 +1003,7 @@ Cases:
 - 编译通过（`make` 只在链接阶段缺少 B 的 `proc_init`，C 的四个函数均已编译并解析）
 - `switch_to` 反汇编核对通过：14 条 `sd` + 14 条 `ld`，偏移 `0/8/16/.../104`，最后 `ret`
 -  `proc_run` 反汇编核对通过：有 `csrr sstatus`、`csrw satp`、`sfence.vma`，并通过 `jalr` 调用 `switch_to`
--  `make qemu` 和 `[Test Schedule] PASS` 待 B 的 `proc_init` 合入后验证
+-  `make qemu` 正常打印 initproc 三行，`make grade` 的 `[Test Schedule]` 通过（详见第五节）
 
 **关键改进点总结：**
 
@@ -627,7 +1014,7 @@ Cases:
 
 #### 验证结果
 
-C 的代码已经通过编译和静态反汇编验证：`switch_to` 的 14 个寄存器偏移与 `struct context` 完全一致，`proc_run` 中能看到 `satp` 写入、`sfence.vma` 和 `switch_to` 调用；当前 `make` 只剩 B 的 `proc_init` 未定义。等 B 的 `proc_init` 合入后，按 `make qemu` 和 `make grade` 补充运行结果与截图。
+C 的代码先通过编译和静态反汇编验证：`switch_to` 的 14 个寄存器偏移与 `struct context` 完全一致，`proc_run` 中能看到 `satp` 写入、`sfence.vma` 和 `switch_to` 调用。B 的 `proc_init` 合入后，整树 `make` 编译通过，`make qemu` 正常打印 initproc 三行，`make grade` 的 `[Test Schedule]` 通过，最终 `Total Score: 30/30`，运行结果与截图见第五节。
 
 ### Challenge题目1：说明语句 `local_intr_save(intr_flag); ... local_intr_restore(intr_flag);` 是如何实现开关中断的。
 
@@ -662,49 +1049,41 @@ get_pte() 在 Sv39 下要走三级页表：先用线性地址的最高一段索�
 
 ## 五、测试与验证
 
-**测试截图：**
-
-截图待 `make qemu` 和 `make grade` 跑通后补充，计划放在 `report/images/` 下：
-
-- `lab4_qemu_initproc.png`：`make qemu` 打印 `this initproc` 三行；
-- `lab4_grade_schedule.png`：`make grade` 的 `[Test Schedule] PASS` 和 `Total Score: 30/30`。
-
 **编译与运行：**
 
-在 Ubuntu/WSL 的 `~/lab4/code` 下执行：
+在 Ubuntu/WSL 的 `code/` 目录下执行：
+
 ```bash
 make clean
 make
 make qemu
+make grade
 ```
 
-当前 C 的代码已经编译通过；`make` 只在链接阶段缺 B 的 `proc_init`，等 B 的 function2 合入后即可生成 `bin/kernel`。`make qemu` 的预期输出为：
-```text
-this initproc, pid = 1, name = "init"
-To U: "Hello world!!".
-To U: "en.., Bye, Bye. :)".
-kernel panic at kern/process/proc.c:...:
-    process exit!!.
-```
-
-最后的 `process exit!!.` 是 lab4 里 `do_exit` 的 panic 桩，属于预期行为。
+`make clean && make` 完整重新编译通过，生成 `bin/kernel` 和 `bin/ucore.img`，退出码为 0。
 
 **测试结果：**
 
-C 的调度模块目前完成了两项静态验证：
+`make qemu` 打开时钟中断后打印 `this initproc` 三行，随后进入内核调试监视器：
+
+![make qemu 输出](images/lab4_qemu_initproc.png)
+
+这说明 idleproc 已经通过 `schedule → proc_run → switch_to` 切换到 initproc，并沿 `forkret → forkrets → __trapret → kernel_thread_entry` 进入 `init_main`。最后的 `process exit!!.` 是 lab4 里 `do_exit` 的 panic 桩，属于预期行为；panic 后进入内核调试监视器，说明 trapframe、上下文和页表切换都是一致的。
+
+`make grade` 注入的三项测试全部通过，总分为 30/30：
+
+![make grade 输出](images/lab4_grade_schedule.png)
+
+注入测试后的串口输出中三个测试均为 PASS：
+
+![三个测试全部 PASS](images/lab4_tests_pass.png)
+
+三项测试各 10 分：PMM 检查 `page_insert` / `page_remove` 的映射、引用计数和空闲页数；Process Create 检查 idleproc/initproc 的字段与首次运行上下文；Schedule 创建两个测试线程，验证 `schedule → proc_run → switch_to` 能让三个线程轮流运行。
+
+另外通过反汇编对调度模块做静态核对：
 
 1. `switch_to` 反汇编：14 条 `sd` + 14 条 `ld`，偏移 `0/8/16/.../104`，最后 `ret`，与 `struct context` 一致；
 2. `proc_run` 反汇编：能看到 `csrr sstatus`、`csrw satp`、`sfence.vma`，并通过 `jalr` 调用 `switch_to`。
-
-`make grade` 的三项测试（PMM、Process Create、Schedule）需要 B 的 `proc_init` 合入后才能完整运行；目标输出为：
-```text
-check PMM: OK
-check Process Create: OK
-check Schedule: OK
-Total Score: 30/30
-```
-
-等实际跑通后，再把截图和完整日志补到 `report/images/`。
 
 ## 六、实验总结与收获
 
@@ -727,7 +1106,7 @@ Total Score: 30/30
 
 1. 用户态进程与系统调用：实验四的线程都运行在内核态，没有特权级切换，也没有 `fork/exec/wait` 的用户态接口；这些要等 lab5。
 2. 进程同步与死锁：实验只用了关中断保护临界区，没有信号量、管程、条件变量，也没有死锁检测和避免。
-3. 页面置换与缺页异常：实验四的地址空间是预映射的，没有按需分页和页面置换；这些在 lab3 和 lab5 之后才涉及。
+3. 页面置换与缺页异常：实验四的地址空间是预映射的，没有按需分页和页面置换；这些在后续实验（如 lab5、lab9）中才涉及。
 4. 多核调度与负载均衡：实验假设单核，`schedule` 只维护一个 `proc_list`，没有 per-CPU 运行队列、CPU 亲和性和负载均衡。
 5. 文件系统与进程间通信：实验没有文件、管道、共享内存等资源管理；这些在后续实验和课程里。
 6. 实时调度与优先级反转：实验只有 FIFO 和轮转，没有优先级、时间片、实时约束。
@@ -741,6 +1120,7 @@ Total Score: 30/30
 
 
 **成员B（何美璇2411570）**：
+在模块二的开发中，我最大的体会是 AI 不会主动补全提示词里没有写明的隐含条件。第一版提示词只写了每个函数的功能，AI 生成的代码能编译，也能通过一部分测试，但漏掉了 `parent`、新线程的栈指针、`pgdir`，以及 `status` 里的 `SPP`、`SPIE` 位。这些问题有的会让测试直接报错，有的会让系统卡住没有输出，有的测试根本检查不到。后来我把每个函数按不同的执行情况拆成 Case，再把这些容易漏的条件写成可以验证的要求，并写明漏掉之后的后果，生成的结果就完善了。我也认识到测试通过并不等于规格都满足，对测试覆盖不到的条件，比如开中断和失败时的资源回收，需要对照规格自己逐条检查代码。
 
 
 
