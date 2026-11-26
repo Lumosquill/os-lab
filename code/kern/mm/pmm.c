@@ -629,3 +629,44 @@ static int get_pgtable_items(size_t left, size_t right, size_t start,
     }
     return 0;
 }
+
+//lab5 function1 2410699 print_pgdir
+//只读遍历当前地址空间的页表：1GB 叶子页单独打印，其余按 4KB 区间合并打印
+void print_pgdir(void) {
+    cprintf("-------------------- BEGIN --------------------\n");
+    pde_t *pgdir = (current->mm != NULL && current->mm->pgdir != NULL)
+                       ? current->mm->pgdir : boot_pgdir_va;
+    for (size_t i = 0; i < NPDEENTRY; i++) 
+    {
+        if (!(pgdir[i] & PTE_V)) 
+        {
+            continue;
+        }
+        if (pgdir[i] & (PTE_R | PTE_W | PTE_X)) 
+        {     
+            // 1GB 叶子页（boot 页表第 511 项）
+            cprintf("  |-- PDE(%s) %016lx-%016lx\n", perm2str(pgdir[i] & PTE_USER),
+                    PGADDR(i, 0, 0, 0), PGADDR(i + 1, 0, 0, 0) - 1);
+            continue;                                  
+        }
+        pde_t *pd0 = (pde_t *)KADDR(PDE_ADDR(pgdir[i]));
+        for (size_t j = 0; j < NPDEENTRY; j++) 
+        {
+            if (!(pd0[j] & PTE_V)) 
+            {
+                continue;
+            }
+            pte_t *pt = (pte_t *)KADDR(PDE_ADDR(pd0[j]));
+            size_t start = 0, left, right;
+            int perm;
+            while ((perm = get_pgtable_items(0, NPTEENTRY, start, pt, &left, &right)) != 0) 
+            {
+                cprintf("  |-- PTE(%s) %016lx-%016lx\n", perm2str(perm),
+                        PGADDR(i, j, left, 0), PGADDR(i, j, right, 0) - 1);
+                // 合并连续同权限页
+                start = right;                         
+            }
+        }
+    }
+    cprintf("-------------------- END --------------------\n");
+}

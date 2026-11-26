@@ -426,10 +426,23 @@ bad_fork_cleanup_proc:
 }
 // lab5 注意：lab4 版本用 list_add + nr_process++，lab5 要换成 set_links（维护 cptr/yptr/optr），
 // 并保证 current->wait_state == 0。
-//lab5 function3 YOUR CODE
+//lab5 function4 2410699（do_yield / do_kill；do_exit 由 B 接着写在这两个函数后面）
+int do_yield(void) {
+    current->need_resched = 1;
+    return 0;
+}
 
-
-//lab5 function4 YOUR CODE
+int do_kill(int pid) {
+    struct proc_struct *proc = find_proc(pid);
+    if (proc == NULL || proc == idleproc || proc == initproc) {
+        return -E_INVAL;
+    }
+    proc->flags |= PF_EXITING;
+    if (proc->state == PROC_SLEEPING) {
+        wakeup_proc(proc);
+    }
+    return 0;
+}
 
 
 #define __KERNEL_EXECVE(name, binary, size) ({           \

@@ -132,25 +132,61 @@ void interrupt_handler(struct trapframe *tf) {
     }
 }
 
-// 2411570 实现：异常处理
+//lab5 function1 2410699 exception_handler
 void exception_handler(struct trapframe *tf) {
-    switch (tf->cause) {
+    switch (tf->cause) 
+    {
         case CAUSE_ILLEGAL_INSTRUCTION:
             cprintf("Illegal instruction at 0x%08x\n", tf->epc);
-            // epc 保存的是出错指令本身，需要越过它，否则 sret 后会再次触发同一个异常
-            tf->epc += insn_length(tf->epc);
+            if (trap_in_kernel(tf)) 
+            {
+                // 内核态：越过出错指令
+                tf->epc += insn_length(tf->epc);     
+            } 
+            else 
+            {
+                // 用户态跑飞：杀进程
+                do_exit(-E_KILLED);                  
+            }
             break;
         case CAUSE_BREAKPOINT:
             cprintf("Breakpoint at 0x%08x\n", tf->epc);
-            // ebreak 可能被汇编成 2 字节的 c.ebreak，所以不能固定加 4
+            // gdb 在用户程序里下断点靠 ebreak，用户态一杀进程，分支任务的 gdb 调试直接失效
             tf->epc += insn_length(tf->epc);
             break;
-        //lab5 function1 YOUR CODE update exception_handler
-        // 待补：case CAUSE_USER_ECALL（epc 前移后转交 syscall），
-        //       以及用户态下其它异常（缺页、非法指令等）的处理（应让该进程退出，不能直接返回）
-        default:
-            // 其他异常不处理，输出完整现场。不读取 epc 指向的内存，也不修改 epc
+        case CAUSE_USER_ECALL:
+            // ecall 固定 4 字节；断言 0x1000→0x1004
+            tf->epc += 4;                            
+            syscall();
+            break;
+        case CAUSE_MISALIGNED_FETCH:
+        case CAUSE_FETCH_ACCESS:
+        case CAUSE_MISALIGNED_LOAD:
+        case CAUSE_LOAD_ACCESS:
+        case CAUSE_MISALIGNED_STORE:
+        case CAUSE_STORE_ACCESS:
+        case CAUSE_FETCH_PAGE_FAULT:
+        case CAUSE_LOAD_PAGE_FAULT:
+        case CAUSE_STORE_PAGE_FAULT:
+            // [C 的 COW 接入点] 只对 STORE_PAGE_FAULT 有意义，C 在这里加 1-2 行：
+            if (trap_in_kernel(tf)) 
+            {
+                print_trapframe(tf);
+                panic("unexpected trap in kernel.\n");
+            }
             print_trapframe(tf);
+            // 用户态缺页：终止，不能返回
+            do_exit(-E_KILLED);                      
+            break;
+        default:
+            if (trap_in_kernel(tf)) 
+            {
+                // 保持 lab4 行为：只打印
+                print_trapframe(tf);
+                break;                               
+            }
+            print_trapframe(tf);
+            do_exit(-E_KILLED);
             break;
     }
 }
